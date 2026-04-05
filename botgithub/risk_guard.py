@@ -565,9 +565,11 @@ class RiskGuard:
             if pos.trailing_dist_atr_mult is not None:
                 trailing_dist = pos.trailing_dist_atr_mult * atr / price  # AI 动态指定
             else:
-                # 从 0.8→1.2 ATR（震荡）和 1.0→1.5 ATR（震荡激进），给正常波动留出呼吸空间
-                _td_mult = 2.0 if market_mode == "趋势" else (1.5 if market_mode == "震荡激进" else 1.2)
+                # 震荡市放宽：1.2→1.5 ATR，震荡激进 1.5→1.8 ATR，趋势保持 2.0
+                _td_mult = 2.0 if market_mode == "趋势" else (1.8 if market_mode == "震荡激进" else 1.5)
                 trailing_dist = _td_mult * atr / price
+                # 最低价距兜底：ATR极小时至少 0.15%，防止正常噪声扫损
+                trailing_dist = max(trailing_dist, 0.0015)
         else:
             trailing_dist = CFG.trailing_dist_pct  # 兜底用配置值
 
