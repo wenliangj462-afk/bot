@@ -2157,17 +2157,41 @@ class ETHTrader:
                             )
                             _rej_suppressed = True
                     if not _rej_suppressed:
-                        _spike_tag = "  🔥波动唤醒" if _spike_bypass else ""
-                        log.info(f"📋 [{sym}] 规则引擎预筛选{_spike_tag}: {rule_result['reason']}，置信度={rule_conf:.2f}，直接{action}")
-                        fast_decision = {
-                            "action": action,
-                            "confidence": rule_conf,
-                            "suggested_sl": 0,
-                            "suggested_tp": 0,
-                            "suggested_leverage": min(CFG.max_leverage, 5),
-                            "reason": rule_result["reason"],
-                            "thought_process": f"[规则引擎] {rule_result['reason']}"
-                        }
+                        # ── 分模式硬过滤 ──
+                        _vol_rule = ind_15m.get("vol_surge", 0)
+                        _ob_rule  = depth.get("imbalance", 0)
+                        _adx_rule = ind_15m.get("adx", 0)
+                        _is_long_rule = (action == "open_long")
+                        if _osc_market == "趋势":
+                            _vol_pass = _vol_rule >= 1.4
+                            _ob_pass  = (_is_long_rule and _ob_rule > 0.25) or (not _is_long_rule and _ob_rule < -0.25)
+                            _adx_pass = _adx_rule >= 22
+                            _ok_rule = _vol_pass and _ob_pass and _adx_pass
+                            _why_fail = []
+                            if not _vol_pass: _why_fail.append(f"vol={_vol_rule:.1f}x<1.4")
+                            if not _ob_pass:  _why_fail.append(f"imb={_ob_rule:+.3f}")
+                            if not _adx_pass: _why_fail.append(f"adx={_adx_rule:.1f}<22")
+                        else:  # 震荡 / 震荡激进
+                            _vol_pass = _vol_rule >= 1.2
+                            _ob_pass  = (_is_long_rule and _ob_rule > 0.20) or (not _is_long_rule and _ob_rule < -0.20)
+                            _ok_rule = _vol_pass and _ob_pass
+                            _why_fail = []
+                            if not _vol_pass: _why_fail.append(f"vol={_vol_rule:.1f}x<1.2")
+                            if not _ob_pass:  _why_fail.append(f"imb={_ob_rule:+.3f}")
+                        if not _ok_rule:
+                            log.debug(f"🔇 [{sym}] 规则引擎信号被分模式过滤拦截({', '.join(_why_fail)})，降级为AI推理")
+                        else:
+                            _spike_tag = "  🔥波动唤醒" if _spike_bypass else ""
+                            log.info(f"📋 [{sym}] 规则引擎预筛选{_spike_tag}: {rule_result['reason']}，置信度={rule_conf:.2f}，直接{action}")
+                            fast_decision = {
+                                "action": action,
+                                "confidence": rule_conf,
+                                "suggested_sl": 0,
+                                "suggested_tp": 0,
+                                "suggested_leverage": min(CFG.max_leverage, 5),
+                                "reason": rule_result["reason"],
+                                "thought_process": f"[规则引擎] {rule_result['reason']}"
+                            }
                 # 规则引擎信号优先级最高，不执行后续快速决策（ breakout/MA/MACD）
 
         # 静默拦截：持仓时若市场无明显变化且未超过静默期，则跳过AI请求
@@ -2188,11 +2212,24 @@ class ETHTrader:
             # 检测向上突破
             breakout_up = self.signals._detect_breakout(raw_15m, price, direction="long", ind_15m=ind_15m, market_mode=_osc_market)
             breakout_down = self.signals._detect_breakout(raw_15m, price, direction="short", ind_15m=ind_15m, market_mode=_osc_market)
-            # 优先处理有明显方向的突破（5分钟冷却：防同一突破重复触发）
-            _bo_cooldown = 300  # 秒
+            # 优先处理有明显方向的突破（冷却：趋势市5min，震荡市10min）
+            _bo_cooldown = 600 if _osc_market != "趋势" else 300
             _now_mono = time.monotonic()
+            # 分模式硬过滤（突破属于趋势信号，需要 ADX 确认）
+            _adx_bo = ind_15m.get("adx", 0)
+            if _osc_market == "趋势":
+                _adx_bo_ok = _adx_bo >= 22
+                _vol_bo_min = 1.4
+                _ob_bo_min = 0.25
+            else:  # 震荡 / 震荡激进
+                _adx_bo_ok = True  # 震荡市不要求 ADX
+                _vol_bo_min = 1.2
+                _ob_bo_min = 0.20
             if breakout_up.get("breakout") and breakout_up.get("confidence", 0) >= 0.6:
-                if _now_mono - self._last_breakout_ts["up"] >= _bo_cooldown:
+                _vol_bo_up = ind_15m.get("vol_surge", 0)
+                _ob_bo_up  = depth.get("imbalance", 0)
+                _bo_up_ok = _vol_bo_up >= _vol_bo_min and _ob_bo_up > _ob_bo_min and _adx_bo_ok
+                if _bo_up_ok and _now_mono - self._last_breakout_ts["up"] >= _bo_cooldown:
                     self._last_breakout_ts["up"] = _now_mono
                     self._consecutive_hold = 0       # 突破信号唤醒，重置冷静期
                     self._ai_hold_wait = 0
@@ -2202,15 +2239,24 @@ class ETHTrader:
                             "action": "open_long",
                             "confidence": breakout_up["confidence"],
                             "suggested_sl": breakout_up.get("sl", price - breakout_up.get("atr", 20) * 1.5),
-                            "suggested_tp": 0,  # AI后续会计算
+                            "suggested_tp": 0,
                             "suggested_leverage": min(CFG.max_leverage, 8),
                             "reason": breakout_up["reason"],
                             "thought_process": f"[打板快速决策] {breakout_up['reason']}"
                         }
+                elif not _bo_up_ok:
+                    _why_fail = []
+                    if _vol_bo_up < _vol_bo_min: _why_fail.append(f"vol={_vol_bo_up:.1f}x")
+                    if _ob_bo_up <= _ob_bo_min:  _why_fail.append(f"imb={_ob_bo_up:+.3f}")
+                    if not _adx_bo_ok:           _why_fail.append(f"adx={_adx_bo:.1f}")
+                    log.debug(f"🔇 [{sym}] 打板多头信号被分模式过滤拦截({', '.join(_why_fail)})，降级为AI推理")
                 else:
                     log.debug(f"⏳ [{sym}] 打板多头信号冷却中（距上次 {_now_mono - self._last_breakout_ts['up']:.0f}s < {_bo_cooldown}s），跳过")
             elif breakout_down.get("breakout") and breakout_down.get("confidence", 0) >= 0.6:
-                if _now_mono - self._last_breakout_ts["down"] >= _bo_cooldown:
+                _vol_bo_dn = ind_15m.get("vol_surge", 0)
+                _ob_bo_dn  = depth.get("imbalance", 0)
+                _bo_dn_ok = _vol_bo_dn >= _vol_bo_min and _ob_bo_dn < -_ob_bo_min and _adx_bo_ok
+                if _bo_dn_ok and _now_mono - self._last_breakout_ts["down"] >= _bo_cooldown:
                     self._last_breakout_ts["down"] = _now_mono
                     self._consecutive_hold = 0       # 突破信号唤醒，重置冷静期
                     self._ai_hold_wait = 0
@@ -2225,6 +2271,12 @@ class ETHTrader:
                             "reason": breakout_down["reason"],
                             "thought_process": f"[打板快速决策] {breakout_down['reason']}"
                         }
+                elif not _bo_dn_ok:
+                    _why_fail = []
+                    if _vol_bo_dn < _vol_bo_min: _why_fail.append(f"vol={_vol_bo_dn:.1f}x")
+                    if _ob_bo_dn >= -_ob_bo_min: _why_fail.append(f"imb={_ob_bo_dn:+.3f}")
+                    if not _adx_bo_ok:           _why_fail.append(f"adx={_adx_bo:.1f}")
+                    log.debug(f"🔇 [{sym}] 打板空头信号被分模式过滤拦截({', '.join(_why_fail)})，降级为AI推理")
                 else:
                     log.debug(f"⏳ [{sym}] 打板空头信号冷却中（距上次 {_now_mono - self._last_breakout_ts['down']:.0f}s < {_bo_cooldown}s），跳过")
 
@@ -2253,10 +2305,19 @@ class ETHTrader:
                 vol_surge = ind_15m.get("vol_surge", 1.0)
                 atr = ind_15m.get("atr", 20)
 
+                # 分模式硬过滤（MA/MACD属于趋势信号，趋势市需要 ADX 确认）
+                _adx_ma = ind_15m.get("adx", 0)
+                _ma_adx_ok = _osc_market == "趋势" and _adx_ma < 22  # 趋势市ADX不足时拦截
+                # ── OB盘口方向对齐（4个子信号共用）──
+                _ob_ma = depth.get("imbalance", 0)
                 # MA黄金交叉 + 强放量(>=1.8) → 快速做多
                 # 门槛高于MACD：MA5/MA10在15m上噪音大，需更强放量确认
                 if ma_golden_cross and vol_surge >= 1.8:
-                    if not self.fast_lane._is_redundant_fast_signal(sym, "MA_GOLDEN", "open_long", 0.65):
+                    if _ma_adx_ok:
+                        log.debug(f"🔇 [{sym}] MA黄金交叉被ADX过滤拦截(adx={_adx_ma:.1f}<22, market={_osc_market})，降级为AI推理")
+                    elif _ob_ma <= 0.20:
+                        log.debug(f"🔇 [{sym}] MA黄金交叉被OB盘口过滤拦截(imb={_ob_ma:+.3f}≤0.20)，降级为AI推理")
+                    elif not self.fast_lane._is_redundant_fast_signal(sym, "MA_GOLDEN", "open_long", 0.65):
                         log.warning(f"🚀 [{sym}] MA黄金交叉+放量信号，使用快速开多")
                         fast_decision = {
                             "action": "open_long",
@@ -2269,7 +2330,11 @@ class ETHTrader:
                         }
                 # MACD柱状线从负转正 + 放量(>=1.3) → 快速做多（MACD已平滑，门槛低于MA交叉）
                 elif macd_cross_up and vol_surge >= 1.3:
-                    if not self.fast_lane._is_redundant_fast_signal(sym, "MACD_GOLDEN", "open_long", 0.68):
+                    if _ma_adx_ok:
+                        log.debug(f"🔇 [{sym}] MACD金叉被ADX过滤拦截(adx={_adx_ma:.1f}<22, market={_osc_market})，降级为AI推理")
+                    elif _ob_ma <= 0.20:
+                        log.debug(f"🔇 [{sym}] MACD金叉被OB盘口过滤拦截(imb={_ob_ma:+.3f}≤0.20)，降级为AI推理")
+                    elif not self.fast_lane._is_redundant_fast_signal(sym, "MACD_GOLDEN", "open_long", 0.68):
                         log.warning(f"🚀 [{sym}] MACD金叉+放量信号，使用快速开多")
                         fast_decision = {
                             "action": "open_long",
@@ -2282,7 +2347,11 @@ class ETHTrader:
                         }
                 # MA死叉 + 强放量(>=1.8) → 快速做空
                 elif ma_death_cross and vol_surge >= 1.8:
-                    if not self.fast_lane._is_redundant_fast_signal(sym, "MA_DEATH", "open_short", 0.65):
+                    if _ma_adx_ok:
+                        log.debug(f"🔇 [{sym}] MA死叉被ADX过滤拦截(adx={_adx_ma:.1f}<22, market={_osc_market})，降级为AI推理")
+                    elif _ob_ma >= -0.20:
+                        log.debug(f"🔇 [{sym}] MA死叉被OB盘口过滤拦截(imb={_ob_ma:+.3f}≥-0.20)，降级为AI推理")
+                    elif not self.fast_lane._is_redundant_fast_signal(sym, "MA_DEATH", "open_short", 0.65):
                         log.warning(f"🚀 [{sym}] MA死叉+放量信号，使用快速开空")
                         fast_decision = {
                             "action": "open_short",
@@ -2295,7 +2364,11 @@ class ETHTrader:
                         }
                 # MACD柱状线从正转负 + 放量(>=1.3) → 快速做空
                 elif macd_cross_dn and vol_surge >= 1.3:
-                    if not self.fast_lane._is_redundant_fast_signal(sym, "MACD_DEATH", "open_short", 0.68):
+                    if _ma_adx_ok:
+                        log.debug(f"🔇 [{sym}] MACD死叉被ADX过滤拦截(adx={_adx_ma:.1f}<22, market={_osc_market})，降级为AI推理")
+                    elif _ob_ma >= -0.20:
+                        log.debug(f"🔇 [{sym}] MACD死叉被OB盘口过滤拦截(imb={_ob_ma:+.3f}≥-0.20)，降级为AI推理")
+                    elif not self.fast_lane._is_redundant_fast_signal(sym, "MACD_DEATH", "open_short", 0.68):
                         log.warning(f"🚀 [{sym}] MACD死叉+放量信号，使用快速开空")
                         fast_decision = {
                             "action": "open_short",
@@ -2321,7 +2394,10 @@ class ETHTrader:
             # 超卖 + 支撑附近 → 快速做多
             if (rsi <= 35 and price_now > 0
                     and any(abs(price_now - s["price"]) / price_now < CFG.osc_level_proximity for s in supports)):
-                if not self.fast_lane._is_redundant_fast_signal(sym, "OSC_OVERSOLD", "open_long", 0.60):
+                _ob_osc = depth.get("imbalance", 0)
+                if _ob_osc <= 0.20:
+                    log.debug(f"🔇 [{sym}] 震荡市超卖信号被OB盘口过滤拦截(imb={_ob_osc:+.3f}≤0.20)，降级为AI推理")
+                elif not self.fast_lane._is_redundant_fast_signal(sym, "OSC_OVERSOLD", "open_long", 0.60, cooldown=600):
                     log.info(f"📊 [{sym}] 震荡市超卖+支撑，快速做多 RSI={rsi:.1f}")
                     fast_decision = {
                         "action": "open_long",
@@ -2335,7 +2411,10 @@ class ETHTrader:
             # 超买 + 阻力附近 → 快速做空
             elif (rsi >= 67 and price_now > 0
                     and any(abs(price_now - r["price"]) / price_now < CFG.osc_level_proximity for r in resistances)):
-                if not self.fast_lane._is_redundant_fast_signal(sym, "OSC_OVERBOUGHT", "open_short", 0.60):
+                _ob_osc2 = depth.get("imbalance", 0)
+                if _ob_osc2 >= -0.20:
+                    log.debug(f"🔇 [{sym}] 震荡市超买信号被OB盘口过滤拦截(imb={_ob_osc2:+.3f}≥-0.20)，降级为AI推理")
+                elif not self.fast_lane._is_redundant_fast_signal(sym, "OSC_OVERBOUGHT", "open_short", 0.60, cooldown=600):
                     log.info(f"📊 [{sym}] 震荡市超买+阻力，快速做空 RSI={rsi:.1f}")
                     fast_decision = {
                         "action": "open_short",
@@ -2350,7 +2429,10 @@ class ETHTrader:
             elif rsi <= 45 and rsi > 35 and vol_surge < 0.7 and price_now > 0:
                 # 缩量且RSI从低位回升，视为有效反弹
                 if any(abs(price_now - s["price"]) / price_now < CFG.osc_level_proximity * 2 for s in supports):
-                    if not self.fast_lane._is_redundant_fast_signal(sym, "OSC_PULLBACK", "open_long", 0.58):
+                    _ob_osc3 = depth.get("imbalance", 0)
+                    if _ob_osc3 <= 0.15:
+                        log.debug(f"🔇 [{sym}] 震荡市缩量回踩被OB盘口过滤拦截(imb={_ob_osc3:+.3f}≤0.15)，降级为AI推理")
+                    elif not self.fast_lane._is_redundant_fast_signal(sym, "OSC_PULLBACK", "open_long", 0.58, cooldown=600):
                         log.info(f"📊 [{sym}] 震荡市缩量回踩支撑+RSI修复，快速做多 RSI={rsi:.1f} vol_surge={vol_surge:.1f}")
                         fast_decision = {
                             "action": "open_long",
@@ -2375,7 +2457,10 @@ class ETHTrader:
             # 第二确认：imbalance > 0.6（买盘深度明显占优）避免在均衡市被假信号骗
             imb_agg = depth.get("imbalance", 0)
             if bb_pct_agg <= 0.10 and vol_surge_agg >= 1.5 and rsi_agg <= 35 and abs(imb_agg) > 0.6:
-                if not self.fast_lane._is_redundant_fast_signal(sym, "OSC_BB_LOW", "open_long", 0.65):
+                # 方向对齐：做多看买盘失衡(imb > 0)
+                if imb_agg <= 0:
+                    log.debug(f"🔇 [{sym}] 震荡激进BB做多信号被OB方向过滤拦截(imb={imb_agg:+.3f}≤0，买方未主导)，降级为AI推理")
+                elif not self.fast_lane._is_redundant_fast_signal(sym, "OSC_BB_LOW", "open_long", 0.65, cooldown=600):
                     log.info(f"📊 [{sym}] 震荡激进BB下沿+放量+超卖+失衡，快速做多 bb_pct={bb_pct_agg:.2f} vol={vol_surge_agg:.1f} RSI={rsi_agg:.1f} imb={imb_agg:.2f}")
                     fast_decision = {
                         "action": "open_long",
@@ -2388,7 +2473,10 @@ class ETHTrader:
                     }
             # BB上沿+放量+超买 → 快速做空（区间顶部强压力回落）
             elif bb_pct_agg >= 0.90 and vol_surge_agg >= 1.5 and rsi_agg >= 65 and abs(imb_agg) > 0.6:
-                if not self.fast_lane._is_redundant_fast_signal(sym, "OSC_BB_HIGH", "open_short", 0.65):
+                # 方向对齐：做空看卖盘失衡(imb < 0)
+                if imb_agg >= 0:
+                    log.debug(f"🔇 [{sym}] 震荡激进BB做空信号被OB方向过滤拦截(imb={imb_agg:+.3f}≥0，卖方未主导)，降级为AI推理")
+                elif not self.fast_lane._is_redundant_fast_signal(sym, "OSC_BB_HIGH", "open_short", 0.65, cooldown=600):
                     log.info(f"📊 [{sym}] 震荡激进BB上沿+放量+超买+失衡，快速做空 bb_pct={bb_pct_agg:.2f} vol={vol_surge_agg:.1f} RSI={rsi_agg:.1f} imb={imb_agg:.2f}")
                     fast_decision = {
                         "action": "open_short",
@@ -2400,15 +2488,21 @@ class ETHTrader:
                         "thought_process": "[震荡激进快速决策] BB上沿+放量+超买+盘口失衡确认"
                     }
 
-        # ── Fast Decision 上下文（极简，仅约35 tokens）────────────────────────
+        # ── Fast Decision 上下文（signal_hint 非绑定参考）────────────────────
         _fast_context = ""
         if fast_decision is not None:
-            _fast_context = f"""
-[快速决策信号]
-类型: {fast_decision['action']}
-置信度: {fast_decision.get('confidence', 0):.2f}
-原因: {fast_decision.get('reason', '')[:60]}
-"""
+            _fd_src = fast_decision.get("thought_process", "")
+            _fd_act = fast_decision["action"]
+            _fd_dir = "short" if _fd_act == "open_short" else "long"
+            _fd_vol = ind_15m.get("vol_surge", 0)
+            _fd_ob  = depth.get("imbalance", 0)
+            _fast_context = (
+                f"\n[规则引擎参考信号(非绑定)]\n"
+                f"方向: {_fd_dir} | 置信度: {fast_decision.get('confidence', 0):.2f} | "
+                f"来源: {_fd_src[:50]}\n"
+                f"成交量: {_fd_vol:.1f}x | 盘口失衡: {_fd_ob:+.3f} | "
+                f"原因: {fast_decision.get('reason', '')[:60]}\n"
+            )
 
         # ── EAT-FLOW 吃单流量 + VSpike 突增（注入 fast_context）────────────
         _vs = self.vspike.get_status()
@@ -2639,7 +2733,7 @@ class ETHTrader:
                             "trend_alignment_score": _ts_fast,
                         },
                     )
-                    if _fd_score["score"] >= CFG.conviction_full_score:  # 82分 bypass
+                    if _fd_score["score"] >= CFG.conviction_full_score:  # 88分 bypass
                         # Grok微调：黑天鹅波动过滤
                         _atr_now = ind_15m.get("atr", 0) if ind_15m else 0
                         _vol_surge_now = ind_15m.get("vol_surge", 1.0) if ind_15m else 1.0
@@ -2648,8 +2742,11 @@ class ETHTrader:
                         if _is_black_swan:
                             _bypass_kelly = min(_bypass_kelly, 0.9)
                             log.info(f"⚡ [{sym}] 黑天鹅过滤: vol_surge={_vol_surge_now:.1f}x Kelly cap→0.9")
+                        _fd_ai_conf_bypass = _fd_score.get("components", {}).get("ai_raw", 0)
                         log.info(
-                            f"⚡ [{sym}] fast_decision Bypass | score={_fd_score['score']} kelly={_bypass_kelly:.2f} | reason={fast_decision.get('reason', '规则高分共振')}"
+                            f"⚡ [{sym}] fast_decision Bypass | score={_fd_score['score']} ai_conf(raw)={_fd_conf:.2f} "
+                            f"ai_component={_fd_score['components'].get('ai_raw',0):.0f} kelly={_bypass_kelly:.2f} | "
+                            f"reason={fast_decision.get('reason', '规则高分共振')}"
                         )
                         decision = fast_decision
                         self.fast_lane._clear_ai_cache(symbol=sym)
@@ -2709,9 +2806,13 @@ class ETHTrader:
                     _prev_rej = self._fast_rejection_cache.get(_rej_key)
                     _rej_count = (_prev_rej[1] + 1) if _prev_rej else 1
                     self._fast_rejection_cache[_rej_key] = (_fd_action_rej, _rej_count, time.monotonic())
+                    _fd_comps = _fd_score.get("components", {})
                     log.info(
                         f"🚫 [{sym}] 快速决策预检拦截: ConvictionScore={_fd_score['score']:.1f}"
-                        f" < {CFG.conviction_open_min}（第{_rej_count}次拒绝），信号降级"
+                        f" < {CFG.conviction_open_min} "
+                        f"(ai_raw={_fd_comps.get('ai_raw',0):.0f} spike={_fd_comps.get('spike',0):.0f} "
+                        f"ob={_fd_comps.get('ob',0):.1f}) "
+                        f"第{_rej_count}次拒绝，信号降级"
                     )
                     fast_decision = None
                     return
