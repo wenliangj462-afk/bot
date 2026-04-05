@@ -200,7 +200,10 @@ class PositionExec:
 
             # ── 3. 追踪止损距离更新 ──────────────────────────────────────────
             if trail_atr > 0:
-                trail_atr = max(0.5, min(2.5, trail_atr))
+                # 震荡模式保护：不低于 1.0x ATR
+                if market_mode in ("震荡", "震荡激进"):
+                    trail_atr = max(trail_atr, 1.0)
+                trail_atr = max(0.8, min(3.0, trail_atr))
                 with self.trader.lock:
                     pos.trailing_dist_atr_mult = trail_atr
                     save_state_to_disk(pos)
