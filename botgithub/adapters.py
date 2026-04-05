@@ -643,11 +643,20 @@ class ConvictionScorer:
               market_mode:  str   = "趋势",
               context:       Dict  = None,
     ) -> Dict:
+        # ── 硬门槛：AI 置信度不足直接打回 ──
+        if ai_conf < 0.55:
+            return {
+                "score":       0.0,
+                "kelly_ratio": 0.0,
+                "env_mult":    1.0,
+                "risk_mult":   1.0,
+                "components": {"ai_raw": 0, "spike": 0, "ob": 0, "level": 0, "rsi_penalty": 0},
+            }
         is_long = action == "open_long"
         _ai_w_mult = float(gs_get("ai_weight_mult", 1.0))
-        ai_score = ai_conf * 65.0 * _ai_w_mult  # 降低 AI 主导权，从 80→65
+        ai_score = ai_conf * 85.0 * _ai_w_mult  # 从 65→85，AI 权重提升到 ~0.70
         tau = 4.5  # 从 8.0→4.5，让 2x~6x 区间分数梯度更明显
-        spike_score = 25.0 * math.tanh(vspike_mult / tau) if vspike_mult > 0 else 0.0
+        spike_score = 18.0 * math.tanh(vspike_mult / tau) if vspike_mult > 0 else 0.0  # 从 25→18，降低 VSpike 占比
         # VSpike ≥6.0x 提供逃生窗口：额外 +15 bonus，不受 tanh 饱和限制
         if vspike_mult >= 6.0:
             spike_score += 15.0
@@ -896,12 +905,13 @@ class SmartAIConsultant:
             f"{fast_context}\n"
             + (f"[历史案例]{rag_warning}\n\n" if rag_warning else "\n")
             + f"{pos_block}\n\n"
-            f"[5条铁律]\n"
-            f"1.方向中性：只看信号强度，不追涨杀跌。\n"
-            f"2.止损必给：open必须同时给suggested_sl和suggested_tp。\n"
-            f"3.关键位锚定：止损优先锚定最近支撑/阻力，再考虑ATR。\n"
-            f"4.数据自洽：说超买需RSI>=70(震荡>=65)，背离需div=bullish/bearish。\n"
-            f"5.趋势市顺势追击，震荡市均值回归。\n\n"
+            f"[决策原则]\n"
+            f"1.规则引擎信号仅作参考，你可自由否决。若数据不支持（RSI/盘口/量能矛盾），直接hold。\n"
+            f"2.方向中性：只看信号强度，不追涨杀跌。\n"
+            f"3.止损必给：open必须同时给suggested_sl和suggested_tp。\n"
+            f"4.关键位锚定：止损优先锚定最近支撑/阻力，再考虑ATR。\n"
+            f"5.数据自洽：说超买需RSI>=70(震荡>=65)，背离需div=bullish/bearish。\n"
+            f"6.趋势市顺势追击，震荡市均值回归。\n\n"
             f"只输出JSON:\n"
             f'{{"action":"","confidence":0.0~1.0,"suggested_sl":数值,"suggested_tp":数值,'
             f'"suggested_leverage":1~{CFG.max_leverage},"reason":"一句话","wait_seconds":0~300}}'
@@ -944,6 +954,7 @@ class SmartAIConsultant:
             f"资金费={funding.get('funding_rate',0)*100:+.3f}% | 盘口失衡={depth.get('imbalance',0):.2f}\n"
             f"{fast_context}\n\n"
             f"[持仓]{pos_block}\n\n"
+            f"[决策原则] 规则引擎信号仅作参考，若数据不支持（RSI/盘口/量能矛盾）直接否决。深度思考后输出。\n\n"
             f"[可选动作]{', '.join(allowed_actions)}\n\n"
             f"深度思考后输出JSON，不要任何解释文字:\n"
             f'{{"action":"","confidence":0.0~1.0,"suggested_sl":数值,"suggested_tp":数值,'
