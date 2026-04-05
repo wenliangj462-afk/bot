@@ -298,7 +298,7 @@ class BotConfig:
     conviction_open_min:        float = float(os.getenv("CONVICTION_OPEN_MIN",        "55.0"))
     osc_conviction_min:         float = float(os.getenv("OSC_CONVICTION_MIN",         "40.0"))
     conviction_vspike_tau:      float = float(os.getenv("CONVICTION_VSPIKE_TAU",      "8.0"))
-    conviction_full_score:      float = float(os.getenv("CONVICTION_FULL_SCORE",      "82.0"))
+    conviction_full_score:      float = float(os.getenv("CONVICTION_FULL_SCORE",      "88.0"))
     price_stale_fallback_secs:  int   = int(os.getenv("PRICE_STALE_FALLBACK_SECONDS", "15"))
     stale_sl_expansion:         float = float(os.getenv("STALE_DATA_SL_EXPANSION",    "1.2"))
     stale_lev_reduction:        float = float(os.getenv("STALE_DATA_LEV_REDUCTION",   "0.8"))
