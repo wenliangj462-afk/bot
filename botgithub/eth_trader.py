@@ -166,6 +166,7 @@ class StateManager:
                             pos.side        = posSide
                             pos.size        = abs(float(p["pos"]))
                             pos.entry_price = float(p["avgPx"])
+                            pos.liq_price   = float(p.get("liqPx", 0))
                             if not pos.open_time:
                                 pos.open_time = datetime.now(UTC)
                     else:
@@ -225,6 +226,13 @@ class StateManager:
                 future = ex.submit(_sync_worker)
                 future.result(timeout=20)
             log.info(f"全量同步完成 | 权益:{self.trader.latest_equity:.2f} 可用:{self.trader.latest_avail_bal:.2f}")
+            # 打印持仓详情，便于排查
+            _p = self.trader.pos
+            if _p.side:
+                log.info(f"📋 [{CFG.symbol}] 持仓: {_p.side} x{_p.leverage} {_p.size}张 @ {_p.entry_price:.2f} "
+                         f"SL={_p.stop_loss:.2f} TP={_p.take_profit:.2f} 强平={_p.liq_price:.2f}")
+            else:
+                log.info(f"📋 [{CFG.symbol}] 无持仓")
         except FTTimeout:
             log.error("全量状态同步超时(20s)，跳过本轮")
         except Exception as e:
@@ -309,6 +317,7 @@ class StateManager:
                 pos.side        = posSide
                 pos.size        = size
                 pos.entry_price = entry
+                pos.liq_price   = float(p.get("liqPx", 0))
                 if not pos.open_time:
                     pos.open_time = datetime.now(UTC)
                 if pos.peak_price == 0.0:
@@ -2904,6 +2913,10 @@ class ETHTrader:
             # 先验 = 近25笔已平仓胜率（每小时由 update_dynamic_params 动态维护）
             # 下限 0.40：防止历史极端低胜率（如0.23）压垮 Kelly 算出负仓位导致系统停摆
             prior = max(0.40, gs_get("last_24h_win_rate", 0.5))
+            # 震荡市 prior 上限下调：24h 滚动胜率包含趋势市高胜率，震荡市实际胜率更低
+            # 用 0.55 上限防止震荡市系统性高估信号质量
+            if self._market_mode in ("震荡", "震荡激进"):
+                prior = min(prior, 0.55)
             # 似然 = AI置信度 × (1 + 失衡度)，截断到 [0.05, 0.95]
             # 上限 0.95 而非 1.0：likelihood=1.0 时 Bayesian 分母退化，posterior 跳至 1.0
             likelihood = max(0.05, min(0.95, ai_conf * (1 + imbal)))
@@ -3528,6 +3541,26 @@ class ETHTrader:
                         "action": action, "reason": _ai_reason[:80]
                     })
                     return
+
+            # ── 开仓前健康检查：REST 验证本地空仓与交易所一致 ──────────────
+            try:
+                _exch_resp = self.trader.get_positions()
+                if _exch_resp.get("code") == "0":
+                    _exch_sym_pos = [
+                        p for p in _exch_resp.get("data", [])
+                        if p.get("instId") == sym and abs(float(p.get("pos", 0))) > 0
+                    ]
+                    if _exch_sym_pos:
+                        _ep = _exch_sym_pos[0]
+                        _ex_side = _ep.get("posSide", "?")
+                        _ex_size = _ep.get("pos", "?")
+                        log.warning(f"⚠️ [{sym}] 开仓前检测到交易所有持仓({_ex_side} {_ex_size})，跳过开仓，先同步状态")
+                        self.state.sync_position(sym)
+                        return  # 跳过本次开仓
+                else:
+                    log.debug(f"[{sym}] 开仓前REST校验失败: {_exch_resp}")
+            except Exception as _e:
+                log.debug(f"[{sym}] 开仓前健康检查异常: {_e}")
 
             self.position_exec._do_open(decision, price, balance, ind_15m["atr"], funding, decision_id,
                           risk_mult=risk_mult, symbol=sym,
