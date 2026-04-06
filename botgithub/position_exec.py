@@ -88,8 +88,8 @@ class PositionExec:
             _fc_data     = self.trader.funding_cache.get("data") or {}
             funding_rate = _fc_data.get("funding_rate", 0)
 
-            # ── 冷却：至少间隔 30s ──────────────────────────────────────────
-            if (datetime.now(UTC) - self.trader._last_adjust_time).total_seconds() < 30:
+            # ── 冷却：至少间隔 60s（小资金足够，减少AI调用）─────────────────
+            if (datetime.now(UTC) - self.trader._last_adjust_time).total_seconds() < 60:
                 return
             # ── 追踪止损 AI 调整冷却：每 3 分钟才允许一次 ──────────────────
             if (datetime.now(UTC) - self.trader._last_trailing_adjust).total_seconds() < 180:
