@@ -23,18 +23,16 @@ from market import fetch_market_sentiment_data
 def dynamic_kelly_mult(drawdown_pct: float, win_rate: float, market_mode: str) -> float:
     """
     三因子联动 Kelly 倍数修正因子：
-    1. 回撤因子：回撤 < 4% → 1.0，≥ 4% 线性衰减至地板 0.20
+    1. 回撤因子：回撤 < 2% → 1.0，≥ 2% 线性衰减至地板 0.20（小资金敏感）
     2. 胜率因子：< 40% → 0.75，> 60% → 1.15，40-60% 线性插值
     3. 市场模式因子：趋势市 → 1.12，其余 → 1.0
     最终三因子连乘，钳制在 [0.18, 1.25]
     """
-    # 因子1：回撤
-    if drawdown_pct <= 0:
-        dd_mult = 1.0
-    elif drawdown_pct < 0.04:
+    # 因子1：回撤（小资金更敏感：2% 起开始衰减）
+    if drawdown_pct <= 0 or drawdown_pct < 0.02:
         dd_mult = 1.0
     else:
-        dd_mult = max(0.20, 1.0 - (drawdown_pct - 0.04) * 10)
+        dd_mult = max(0.20, 1.0 - (drawdown_pct - 0.02) * 8)
 
     # 因子2：胜率（min_sample=8 已保证 win_rate 有意义）
     if win_rate < 0.40:
@@ -48,7 +46,10 @@ def dynamic_kelly_mult(drawdown_pct: float, win_rate: float, market_mode: str) -
     mode_mult = 1.12 if market_mode == "趋势" else 1.0
 
     result = dd_mult * wr_mult * mode_mult
-    return max(0.18, min(1.25, result))
+    final = max(0.18, min(1.25, result))
+
+    log.debug(f"Kelly因子: dd={dd_mult:.2f} wr={wr_mult:.2f} mode={mode_mult:.2f} → final={final:.2f}")
+    return final
 
 # 类定义开始
 class RiskGuard:
