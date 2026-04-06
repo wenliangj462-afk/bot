@@ -526,11 +526,12 @@ class PositionExec:
         _adapt_factor = CFG.sl_atr_adapt_factor  # 波动率敏感度，默认 0.5
 
         if market_mode == "震荡激进":
-            # base=1.5，强信号（conf≥0.70）允许稍宽至 1.5×，普通信号收紧至 1.0×
-            _base = 1.5 if ai_conf >= 0.70 else 1.0
+            # 快进快出：高置信留呼吸空间，普通信号紧凑
+            _base = 1.3 if ai_conf >= 0.65 else 1.0
             _floor, _cap = CFG.sl_atr_floor_osc_aggr, CFG.sl_atr_cap_osc_aggr
         elif market_mode == "震荡":
-            _base = CFG.osc_sl_atr_mult
+            # 高置信留更多呼吸空间，防止频繁扫损
+            _base = 1.6 if ai_conf >= 0.65 else 1.4
             _floor, _cap = CFG.sl_atr_floor_osc, CFG.sl_atr_cap_osc
         else:  # 趋势市
             _base = CFG.sl_atr_mult
@@ -608,14 +609,19 @@ class PositionExec:
                 lev = auto_lev
                 max_by_margin = int(effective_bal * lev / (price * ct_val))
 
-        max_margin_budget = min(single_cap, equity_for_cap * CFG.max_margin_pct)
+        # 小资金账户自动提高保证金使用率
+        if effective_bal < 150:
+            effective_cap_pct = max(CFG.max_margin_pct, 0.70)
+        else:
+            effective_cap_pct = CFG.max_margin_pct
+        max_margin_budget = min(single_cap, equity_for_cap * effective_cap_pct)
         max_size_by_margin_cap = max(int(max_margin_budget * lev / (ct_val * price + 1e-9)), 1)
 
         # 计算张数（使用 Kelly 公式优化仓位）
-        # p_win 钳位 [0.45, 0.75]：LLM 置信度非统计概率，Bayesian likelihood=1.0 时
+        # p_win 钳位 [0.48, 0.78]：LLM 置信度非统计概率，Bayesian likelihood=1.0 时
         # posterior 可达 1.0，直接代入 Kelly 会使 f→1.0 虽有 kelly_max_f 兜底但逻辑错误
         _raw_p = dec.get("posterior_confidence", dec.get("confidence", 0.5))
-        p_win = max(0.45, min(0.75, _raw_p))
+        p_win = max(0.48, min(0.78, _raw_p))
         # 盈亏比：TP距离 / SL距离（TP=0 时 Kelly=0，需给出警告）
         tp_dist = abs(tp - price) if tp > 0 else 0
         if tp_dist <= 0:
@@ -623,6 +629,13 @@ class PositionExec:
         b = tp_dist / max(dist, 1e-9)
         # Kelly 公式计算最优资金占比（直接决定风险预算比例）
         ai_conf = dec.get("confidence", 0.5)
+        # ── Kelly 上限：小资金低胜率保护 ──────────────────────────────────
+        _recent_wr = float(gs_get("last_24h_win_rate", 0.5))
+        if effective_bal < 150 and _recent_wr < 0.52:
+            _kelly_cap = 0.55
+            log.debug(f"🛡️ [{sym}] 小资金低胜率保护: 胜率={_recent_wr:.2f} → Kelly上限=0.55")
+        else:
+            _kelly_cap = CFG.kelly_max_f
         # ── 强信号动态 Kelly 上浮机制 ─────────────────────────────────────────
         # 条件：趋势市 conf≥0.75 或 震荡激进 conf≥0.70 或 快速决策 conf≥0.60
         is_strong = (
@@ -634,7 +647,7 @@ class PositionExec:
         if is_strong:
             log.debug(f"🚀 [{sym}] 强信号 Kelly 上浮: {CFG.kelly_fraction:.2f} → {kelly_base:.2f} (conf={ai_conf:.2f} p_win={p_win:.2f} mode={market_mode})")
         kelly_f = kelly_optimal_size(p_win, b, kelly_base)
-        kelly_f = min(kelly_f, CFG.kelly_max_f)  # 应用 Kelly 上限
+        kelly_f = min(kelly_f, _kelly_cap)  # 应用 Kelly 上限（含胜率保护）
         # 委员会强烈反对时（≥2 票反对 且 AI conf < 0.7），Kelly 折扣 50%
         if committee_opposing >= 2 and ai_conf < 0.7:
             kelly_f *= 0.5
@@ -854,6 +867,9 @@ class PositionExec:
             f"📐 [{sym}] 张数计算: 原始={size_by_risk}张 "
             f"lotSz截断后={size}张({size_str}) ctVal={ct_val} 名义={notional:.2f}U"
         )
+        log.info(f"[SIZE_CALC] risk_budget={risk_budget:.2f}U | sl_dist={dist:.2f} | "
+                 f"final_risk_mult={risk_per_trade_dynamic:.3f} | size={size}张 | lev={lev}x | "
+                 f"ai_conf={ai_conf:.2f} | mode={market_mode} | bal={effective_bal:.1f}U")
 
         return {
             "skip": False,
