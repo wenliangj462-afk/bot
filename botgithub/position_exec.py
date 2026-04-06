@@ -107,7 +107,7 @@ class PositionExec:
 1. SL 必须距当前价至少 {CFG.sl_min_atr_mult}×ATR = {sl_min_dist:.4f}（{"做多时 SL ≤ " + f"{price - sl_min_dist:.4f}" if pos.side == "long" else "做空时 SL ≥ " + f"{price + sl_min_dist:.4f}"}），防频繁扫损
 2. partial_tp_pct 仅限 {CFG.partial_tp_min_pct}~{CFG.partial_tp_max_pct} 整数，0=不分批
 3. set_breakeven=true 仅在浮盈为正时有意义（SL 移至入场价附近）
-4. trailing_dist_atr 范围 0.5~2.5（0=不修改）；趋势市建议 1.5~2.0，震荡市建议 0.8~1.2
+4. trailing_dist_atr 范围 0.5~2.5（0=不修改）；趋势市建议 1.8~2.5，震荡市建议 1.8~2.2（最低不低于1.8×ATR，防低波动扫损）
 
 【决策指引】
 - 浮盈 > 0.5%：开始考虑微调（上移 SL、收紧追踪），为利润提供初步保护
@@ -200,9 +200,9 @@ class PositionExec:
 
             # ── 3. 追踪止损距离更新 ──────────────────────────────────────────
             if trail_atr > 0:
-                # 震荡模式保护：不低于 1.0x ATR
+                # 震荡模式保护：不低于 1.8x ATR（低波动市防频繁扫损）
                 if market_mode in ("震荡", "震荡激进"):
-                    trail_atr = max(trail_atr, 1.0)
+                    trail_atr = max(trail_atr, 1.8)
                 trail_atr = max(0.8, min(3.0, trail_atr))
                 with self.trader.lock:
                     pos.trailing_dist_atr_mult = trail_atr
