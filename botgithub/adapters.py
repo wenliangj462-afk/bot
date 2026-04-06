@@ -746,6 +746,8 @@ class SmartAIConsultant:
         pnl = pos_info.get("pnl_pct", 0)
         holding = pos_info.get("holding_minutes", 0)
         side_tag = f"持{side}" if side else "空仓"
+        _recent_wr = float(gs_get("last_24h_win_rate", 0.5))
+        _consec_losses = gs_get("consecutive_losses", 0)
 
         prompt = f"""你是ETH量化交易顾问，当前持仓状态：
 - 持仓方向：{side_tag}
@@ -757,6 +759,7 @@ class SmartAIConsultant:
 - 15m RSI：{ind_15m.get('rsi', 50):.1f}
 - 15m MACD：{ind_15m.get('macd_hist', 0):.4f}
 - 15m BB%：{ind_15m.get('bb_pct', 0.5):.2f}
+- 近期胜率：{_recent_wr*100:.1f}% | 连续亏损：{_consec_losses}次
 
 两个独立模型给出分歧意见：
 - 保守方：{a1}（置信度 {c1:.2f}）→ {r1.get('reason', '无')}
@@ -1176,7 +1179,7 @@ class SmartAIConsultant:
                              prev_market_mode: str, current_price: float) -> bool:
         """
         判断本次决策是否需要 deepseek-reasoner 的强逻辑能力。
-        极端场景（高波动/高风险/刚止损）→ 用 Reasoner 做一票否决兜底。
+        极端场景（连亏/持仓深度浮亏/趋势市高波动）→ 用 Reasoner 做一票否决兜底。
         普通场景 → 只用 deepseek-chat，省 token。
         """
         pnl = self.get_pnl_pct(pos_info, current_price)
@@ -1188,30 +1191,16 @@ class SmartAIConsultant:
         if gs_get("consecutive_losses", 0) >= CFG.reasoner_consec_loss_thresh:
             return True
 
-        # 条件2：ROE ≤ 阈值（合约杠杆感知，无论几倍杠杆统一标准）
+        # 条件2：ROE ≤ 阈值（合约杠杆感知，仅持仓时生效）
         if pos_info.get("side") and roe <= CFG.reasoner_roe_thresh:
             return True
 
-        # 条件3：高波动（ATR 相对均值 > 阈值）
+        # 条件3：趋势市 + 高波动（趋势行情高波动时才需要强逻辑）
         atr_ratio = ind.get("atr_ratio", 1.0) if ind else 1.0
-        if atr_ratio > CFG.reasoner_atr_ratio_thresh:
+        if market == "趋势" and atr_ratio > CFG.reasoner_atr_ratio_thresh:
             return True
 
-        # 条件4：震荡激进 + 高 ATR（避免低波动震荡市无意义等 60s）
-        if market == "震荡激进" and atr_ratio > 1.2:
-            return True
-
-        # 条件5：止损后冷却期内（需 Reasoner 做归因）
-        last_stop = gs_get("last_stop_time")
-        if last_stop:
-            try:
-                _dt = _parse_dt(last_stop)
-                if _dt and (datetime.now(UTC) - _dt).total_seconds() < CFG.reasoner_stop_cooldown_sec:
-                    return True
-            except Exception:
-                pass
-
-        # 默认：普通场景只用 deepseek-chat
+        # 默认：普通场景/震荡市只用 deepseek-chat（Qwen 并行已覆盖第二意见）
         return False
 
     # ── P2 改造：_single_call 支持 model 参数 ─────────────────────────────────
