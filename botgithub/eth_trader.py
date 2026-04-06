@@ -2182,10 +2182,14 @@ class ETHTrader:
                             log.debug(f"🔇 [{sym}] 规则引擎信号被分模式过滤拦截({', '.join(_why_fail)})，降级为AI推理")
                         else:
                             _spike_tag = "  🔥波动唤醒" if _spike_bypass else ""
-                            log.info(f"📋 [{sym}] 规则引擎预筛选{_spike_tag}: {rule_result['reason']}，置信度={rule_conf:.2f}，直接{action}")
+                            # 置信度封顶：规则引擎信号最高 0.72，强制 AI 最终把关
+                            _capped_conf = min(rule_conf, 0.72)
+                            if _capped_conf < rule_conf and not _spike_bypass:
+                                log.debug(f"📎 [{sym}] 规则引擎置信度封顶: {rule_conf:.2f}→{_capped_conf:.2f}")
+                            log.info(f"📋 [{sym}] 规则引擎预筛选{_spike_tag}: {rule_result['reason']}，置信度={_capped_conf:.2f}，直接{action}")
                             fast_decision = {
                                 "action": action,
-                                "confidence": rule_conf,
+                                "confidence": _capped_conf,
                                 "suggested_sl": 0,
                                 "suggested_tp": 0,
                                 "suggested_leverage": min(CFG.max_leverage, 5),
