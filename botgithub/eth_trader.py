@@ -560,6 +560,7 @@ class ETHTrader:
         self._raw_kline_cache: Dict[str, tuple] = {}
         self._RAW_KLINE_TTL: Dict[str, int] = {"3m": 45, "15m": 120, "1H": 300, "4H": 600}
         self._last_adjust_time:     datetime = datetime.min.replace(tzinfo=UTC)
+        self._last_trailing_adjust: datetime = datetime.min.replace(tzinfo=UTC)
 
         # ── 账户余额 ─────────────────────────────────────────────────────
         self.latest_equity:    float = 0.0
