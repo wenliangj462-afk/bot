@@ -11,6 +11,7 @@ import json
 import math
 import threading
 import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from typing import Optional, Dict, List, Any, TYPE_CHECKING
 from datetime import datetime, timezone, timedelta
 from openai import OpenAI
@@ -794,6 +795,46 @@ class SmartAIConsultant:
                 "action": "hold", "confidence": 0.0,
                 "reason": f"投票分歧({a1} vs {a2})，千问仲裁异常，保守观望",
             }
+    # ── 千问并行轻量调用（供主决策并行使用）────────────────────────────────────
+    def _call_qwen_decision(self, simple_prompt: str, allowed_actions: list,
+                            market_mode: str, action_hint: str) -> Optional[Dict]:
+        """
+        千问轻量并行调用：复用 deepseek 的 prompt（~600 tokens），
+        用独立 prompt 做第二意见投票。超时 15s 返回 None。
+        """
+        if not self._qwen_available:
+            return None
+
+        prompt = f"""你是ETH量化交易顾问，请给出交易建议。
+{simple_prompt.split('[5条铁律]')[0] if '[5条铁律]' in simple_prompt else simple_prompt.split('[决策原则]')[0] if '[决策原则]' in simple_prompt else simple_prompt}
+[决策原则]
+1.你只给第二意见，不重复主模型判断。
+2.如果主模型建议{action_hint}但你认为数据不支持，可直接说hold。
+3.输出严格JSON。
+
+只输出JSON:
+{{"action":"","confidence":0.0~1.0,"reason":"一句话"}}"""
+
+        try:
+            response = self._qwen_client.chat.completions.create(
+                model=CFG.qwen_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=300,
+            )
+            content = response.choices[0].message.content.strip()
+            data = json.loads(content)
+            _qa = data.get("action", "hold")
+            if _qa not in allowed_actions:
+                _qa = "hold"
+            return {
+                "action": _qa,
+                "confidence": float(data.get("confidence", 0.5)),
+                "reason": f"[Qwen] {data.get('reason', '')}",
+            }
+        except Exception as e:
+            log.debug(f"🔇 Qwen并行调用失败: {e}")
+            return None
 
     # ── 子方法：构造 prompt ────────────────────────────────────────────────
 
@@ -1151,13 +1192,13 @@ class SmartAIConsultant:
         if pos_info.get("side") and roe <= CFG.reasoner_roe_thresh:
             return True
 
-        # 条件3：震荡激进市场（ADX低+BB窄，均值回归失效，需强逻辑判断）
-        if market == "震荡激进":
-            return True
-
-        # 条件4：高波动（ATR 相对均值 > 阈值）
+        # 条件3：高波动（ATR 相对均值 > 阈值）
         atr_ratio = ind.get("atr_ratio", 1.0) if ind else 1.0
         if atr_ratio > CFG.reasoner_atr_ratio_thresh:
+            return True
+
+        # 条件4：震荡激进 + 高 ATR（避免低波动震荡市无意义等 60s）
+        if market == "震荡激进" and atr_ratio > 1.2:
             return True
 
         # 条件5：止损后冷却期内（需 Reasoner 做归因）
@@ -1187,8 +1228,8 @@ class SmartAIConsultant:
             ]
             _result = _call_reasoner_for_json(
                 self.client, _msgs,
-                max_tokens=4000,   # 限制 token 数，超出部分被截断（截断部分通常是重复推理，不影响结论）
-                timeout=CFG.reasoner_timeout_seconds,  # 独立超时，reasoner 深度思考可能需要 3 分钟
+                max_tokens=4000,   # 限制 token 数，超出部分被截断
+                timeout=60,         # 硬限 60s，超时抛异常让外层 fallback 到 r1
             )
             if _result.get("action") not in allowed_actions:
                 log.warning(f"AI({model})输出了不允许的动作 {_result.get('action')}，强制改为 hold")
@@ -1277,10 +1318,10 @@ class SmartAIConsultant:
                      trend_alignment_score: float = 0.5,
                      trend_dir: str = "neutral") -> Dict:
         """
-        AI 决策主流程（Prompt Diet 版本）：
-        - deepseek-chat T=0.25：精简 prompt（~600 tokens）
-        - deepseek-reasoner：极简 prompt（~300 tokens，不含规则）
-        - hold 直接采纳，节省 token
+        AI 决策主流程（并行投票版）：
+        - deepseek-chat T=0.35：主力（快速稳定）
+        - Qwen：条件并行第二意见（震荡/震荡激进 + 低置信度）
+        - deepseek-reasoner：极端场景一票否决（连亏/高波动/刚止损）
         """
         last_attempt_err = None
         # ── 注入趋势对齐分数到 prompt ─────────────────────────────────────
@@ -1292,9 +1333,17 @@ class SmartAIConsultant:
         _osc_pre  = get_market_mode(ind_15m, _price_bb, prev_market_mode)
         _sc_pre, _desc_pre = _calc_period_score(ind_15m, ind_1h, ind_4h)
 
+        # ── Qwen 并行触发条件：无需 fd_score（此时还未算），用原始指标代替 ──
+        _vol_for_qwen = ind_15m.get("vol_surge", 1.0)
+        _adx_for_qwen = ind_15m.get("adx", 0)
+        _qwen_trigger = (
+            _osc_pre in ("震荡", "震荡激进")
+            or _vol_for_qwen < 0.7  # 缩量，信号边缘
+        )
+
         for attempt in range(max(1, CFG.ai_max_retries)):
             try:
-                # ── Step A: 精简 prompt + deepseek-chat T=0.25 先探路 ─────────
+                # ── Step A: 精简 prompt + deepseek-chat T=0.35 主力 ─────────
                 simple_prompt, allowed_actions = self._build_simple_prompt(
                     ind_15m, ind_1h, ind_4h, news_data, fg_index, funding,
                     depth, pos_info, key_levels, funding_history,
@@ -1303,56 +1352,74 @@ class SmartAIConsultant:
                     fast_context=fast_context,
                     _osc_market=_osc_pre, _period_score=_sc_pre, _score_desc=_desc_pre,
                 )
-                r1 = self._single_call(0.25, simple_prompt, allowed_actions,
+                chat_temp = 0.35 if _osc_pre in ("震荡", "震荡激进") else 0.25
+                log.info(f"📊 [{CFG.symbol}] deepseek-chat T={chat_temp}（{_osc_pre}）")
+                r1 = self._single_call(chat_temp, simple_prompt, allowed_actions,
                                         model="deepseek-chat")
                 a1 = r1.get("action", "hold")
 
                 # hold 直接采纳
                 if a1 in ("hold", "skip"):
-                    log.info(f"🤖 Chat(T0.25): {a1} conf={r1.get('confidence', 0):.2f} — 直接采纳")
+                    log.info(f"🤖 Chat(T{chat_temp}): {a1} conf={r1.get('confidence', 0):.2f} — 直接采纳")
                     gs_set("ai_consecutive_timeout", 0)
                     return r1
 
-                # ── Step B: 有交易信号 → 按需选择模型 ─────────────────────────
+                # ── Step B: 条件并行 Qwen 第二意见 ─────────────────────────
+                qwen_result = None
+                if _qwen_trigger:
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        qwen_future = pool.submit(
+                            self._call_qwen_decision,
+                            simple_prompt, allowed_actions, _osc_pre, a1
+                        )
+                        try:
+                            qwen_result = qwen_future.result(timeout=15)
+                        except FuturesTimeout:
+                            log.debug("⏱️ Qwen 并行调用超时(15s)，降级为仅 chat")
+                            qwen_result = None
+
+                    if qwen_result:
+                        _qc = qwen_result.get("confidence", 0.5)
+                        log.info(f"🔵 Qwen第二意见: {qwen_result.get('action')} conf={_qc:.2f}")
+                        # 加权融合：chat 68% + Qwen 32%
+                        _final_conf = 0.68 * r1.get("confidence", 0.5) + 0.32 * _qc
+                        _final_conf = max(0.0, min(1.0, _final_conf))
+                        r1["confidence"] = round(_final_conf, 3)
+                        r1["reason"] = f"{r1.get('reason','')} [Qwen:{qwen_result.get('reason','')}]"
+                        r1["_qwen_action"] = qwen_result.get("action")
+                        r1["_qwen_conf"] = _qc
+
+                # ── Step C: 极端场景 reasoner 一票否决 ────────────────────
                 use_reasoner = self._should_use_reasoner(
                     pos_info, ind_15m, prev_market_mode,
                     depth.get("mid_price", 0) if depth else 0
                 )
                 if use_reasoner:
-                    # 极简 prompt 给 reasoner，让它充分思考
                     reasoner_prompt, _ = self._build_reasoner_prompt(
                         ind_15m, ind_1h, ind_4h,
                         funding, depth, pos_info,
                         prev_market_mode, fast_context,
                         _osc_market=_osc_pre,
                     )
-                    model_name = "deepseek-reasoner"
-                    model_temp = 0.35
-                    log.info(f"🧠 极端场景 → {model_name}（极简 prompt）")
-                    r2 = self._single_call(model_temp, reasoner_prompt, allowed_actions,
-                                            model=model_name)
+                    log.info(f"🧠 极端场景 → deepseek-reasoner（一票否决）")
+                    r2 = self._single_call(0.35, reasoner_prompt, allowed_actions,
+                                            model="deepseek-reasoner")
+                    # reasoner 一票否决：如果和 chat 方向冲突，投票决定
+                    _, result = self._vote(r1, r2, for_exit_arbitration=False)
                 else:
-                    # 普通场景用精简 prompt + chat
-                    model_name = "deepseek-chat"
-                    model_temp = 0.70
-                    log.info(f"📊 普通场景 → {model_name}(T{model_temp})")
-                    r2 = self._single_call(model_temp, simple_prompt, allowed_actions,
-                                            model=model_name)
+                    result = r1.copy()
 
                 gs_set("ai_consecutive_timeout", 0)
-                # ── 投票：持仓时标记分歧仲裁 ──────────────────────────────
-                has_pos = bool(pos_info.get("side"))
-                _, result = self._vote(r1, r2, for_exit_arbitration=has_pos)
 
                 # ── 持仓分歧千问仲裁 ──────────────────────────────────────
+                has_pos = bool(pos_info.get("side"))
                 if has_pos and result.get("_need_exit_arbitration"):
                     _vs = ind_15m.get("vol_surge", 1.0)
                     _ob = depth.get("imbalance", 0.0) if hasattr(depth, "get") else 0.0
-                    _a1, _a2 = r1.get("action", ""), r2.get("action", "")
-                    _c1, _c2 = r1.get("confidence", 0.0), r2.get("confidence", 0.0)
                     arb_result = self._arbitrate_exit_dispute(
-                        r1, r2, _a1, _a2, _c1, _c2, pos_info,
-                        ind_15m, _osc_pre, _vs, _ob,
+                        r1, result, r1.get("action", ""), result.get("action", ""),
+                        r1.get("confidence", 0.0), result.get("confidence", 0.0),
+                        pos_info, ind_15m, _osc_pre, _vs, _ob,
                     )
                     log.info(f"⚖️ 千问仲裁裁决持仓分歧: {arb_result['action']}(conf={arb_result['confidence']:.2f})")
                     result = arb_result
@@ -1361,12 +1428,12 @@ class SmartAIConsultant:
             except Exception as e:
                 last_attempt_err = e
                 err_str = str(e)
-                is_reasoner_err = "reasoner" in err_str.lower()
                 is_timeout = any(kw in err_str.lower()
                                  for kw in ("timeout", "timed out", "read timeout"))
 
-                if is_reasoner_err and 'r1' in locals() and r1:
-                    log.warning(f"⏱️ Reasoner 超时，采纳 r1={r1.get('action')} conf={r1.get('confidence', 0):.2f}")
+                # 任何模型超时 → fallback 到 r1
+                if 'r1' in locals() and r1:
+                    log.warning(f"⏱️ 模型调用超时/异常，采纳 r1={r1.get('action')} conf={r1.get('confidence', 0):.2f}")
                     gs_set("ai_consecutive_timeout", 0)
                     return r1
 
