@@ -91,6 +91,9 @@ class PositionExec:
             # ── 冷却：至少间隔 30s ──────────────────────────────────────────
             if (datetime.now(UTC) - self.trader._last_adjust_time).total_seconds() < 30:
                 return
+            # ── 追踪止损 AI 调整冷却：每 3 分钟才允许一次 ──────────────────
+            if (datetime.now(UTC) - self.trader._last_trailing_adjust).total_seconds() < 180:
+                return
 
             sl_min_dist = CFG.sl_min_atr_mult * atr  # 止损距当前价最小保护距离
 
@@ -173,6 +176,7 @@ class PositionExec:
                             sz_remain = str(max(1, cur_size - close_sz))
                             self.okx.update_algo_orders(pos.side, sz_remain, new_sl, new_tp, symbol=sym)
                             self.trader._last_adjust_time = datetime.now(UTC)
+                            self.trader._last_trailing_adjust = datetime.now(UTC)
                             log.warning(f"🎯 [{sym}] AI分批止盈: 平{close_sz}张({partial_pct}%) "
                                         f"剩余{sz_remain}张 SL={new_sl:.4f}")
                             _webhook("🎯 AI分批止盈",
@@ -494,6 +498,7 @@ class PositionExec:
                 self.trader._pos_mgr.submit(PositionIntent(PositionIntentType.UPDATE_SL, {"sl": new_sl}, "_adjust_sl_tp"))
                 self.trader._pos_mgr.submit(PositionIntent(PositionIntentType.UPDATE_TP, {"tp": new_tp}, "_adjust_sl_tp"))
                 self.trader._last_adjust_time = datetime.now(UTC)
+                self.trader._last_trailing_adjust = datetime.now(UTC)
                 save_state_to_disk(pos)
             log.info(f"🛡️ [{sym}] SL={new_sl:.4f} TP={new_tp:.4f} | {reason}")
             _webhook("调整止盈止损", f"[{sym}] SL={new_sl:.4f} TP={new_tp:.4f}\n{reason}")
@@ -527,7 +532,7 @@ class PositionExec:
 
         if market_mode == "震荡激进":
             # 快进快出：高置信留呼吸空间，普通信号紧凑
-            _base = 1.3 if ai_conf >= 0.65 else 1.0
+            _base = 1.5 if ai_conf >= 0.65 else 1.2
             _floor, _cap = CFG.sl_atr_floor_osc_aggr, CFG.sl_atr_cap_osc_aggr
         elif market_mode == "震荡":
             # 高置信留更多呼吸空间，防止频繁扫损
