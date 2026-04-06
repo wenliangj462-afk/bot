@@ -188,10 +188,11 @@ class RiskGuard:
                         pos_resp = self.okx.get_positions()
                         if pos_resp.get("code") == "0":
                             # 按品种过滤：只检查 CFG.symbol，不能用 data 非空代替
-                            has_sym_pos = any(
-                                p.get("instId") == CFG.symbol and abs(float(p.get("pos", 0))) > 0
-                                for p in pos_resp.get("data", [])
-                            )
+                            exch_pos_list = [
+                                p for p in pos_resp.get("data", [])
+                                if p.get("instId") == CFG.symbol and abs(float(p.get("pos", 0))) > 0
+                            ]
+                            has_sym_pos = len(exch_pos_list) > 0
                             if not has_sym_pos:
                                 # 幽灵仓位：本地认为有持仓，但交易所没有
                                 log.error(f"👻 [{CFG.symbol}] 幽灵仓位检测：本地持仓{side}但交易所无持仓，尝试平仓清除")
@@ -199,8 +200,25 @@ class RiskGuard:
                                 self.trader.position_exec._close("幽灵仓位清除", symbol=CFG.symbol)
                                 time.sleep(CFG.risk_check_interval)
                                 continue
+                            else:
+                                # 检查交易所仓位与本地是否一致（方向/大小/强平价）
+                                ep = exch_pos_list[0]
+                                exch_side = ep.get("posSide", "")
+                                exch_size = abs(float(ep.get("pos", 0)))
+                                exch_liq = float(ep.get("liqPx", 0))
+                                exch_entry = float(ep.get("avgPx", 0))
+                                if exch_side != side or abs(exch_size - size) > 0.01 or abs(exch_liq - liq) / max(liq, 0.01) > 0.15:
+                                    # 不一致：强制同步本地状态
+                                    log.warning(f"⚠️ [{CFG.symbol}] 本地仓位与交易所不一致 "
+                                                 f"(side:{side}→{exch_side} size:{size}→{exch_size} liq:{liq:.2f}→{exch_liq:.2f})")
+                                    self.trader.state.sync_position(CFG.symbol)
+                                    liq = self.trader.pos.liq_price if self.trader.pos.liq_price > 0 else liq
+                                    size = self.trader.pos.size if self.trader.pos.size > 0 else size
+                                    side = self.trader.pos.side or side
+                        else:
+                            log.debug(f"[{CFG.symbol}] 查询交易所仓位失败: {pos_resp}")
                     except Exception as e:
-                        log.warning(f"[{CFG.symbol}] 幽灵仓位检测异常（将30s后重试）: {e}")
+                        log.warning(f"[{CFG.symbol}] 状态检测异常（将10s后重试）: {e}")
 
                 # 硬止损
                 if pnl_pct <= -CFG.hard_stop_loss_pct:
@@ -241,22 +259,34 @@ class RiskGuard:
                         continue
 
                 # ── SL止损单验证 & 强制市价止损保护 ────────────────────────
-                # 如果pending_ord_id还存在，检查是否已成交/取消
+                # pending_ord_id 是入场主单ID（市价单开仓时立即filled），不是SL算法单ID
+                # SL算法单通过 pos.sl_tp_algo_ids 跟踪，WS orders channel 检测其成交
+                # 这里检查入场单状态：如果已filled且交易所有仓位 → 正常开仓，清理pending_ord_id
                 if pending_ord_id:
                     try:
                         status = self.okx.get_order_status(pending_ord_id)
                         if status.get("code") == "0" and status.get("data"):
                             ord_state = status["data"][0].get("state", "")
-                            # 如果挂单已消失（非live/partially_filled）但本地仍有持仓
-                            # 说明可能是SL附损单被触发成交，或挂单被取消但未同步
                             if ord_state not in ("live", "partially_filled"):
-                                log.warning(f"⚠️ [{CFG.symbol}] 挂单{pending_ord_id}状态={ord_state}，本地持仓未清算，触发市价止损保护")
-                                _webhook("🛡️ SL丢失保护", f"[{CFG.symbol}] 挂单已{ord_state}但本地仍有持仓，执行市价止损")
-                                self.trader.position_exec._close("SL丢失市价保护", symbol=CFG.symbol)
-                                time.sleep(CFG.risk_check_interval)
-                                continue
+                                # 入场单已filled/cancelled，验证交易所仓位状态
+                                pos_resp = self.okx.get_positions()
+                                if pos_resp.get("code") == "0":
+                                    has_sym_pos = any(
+                                        p.get("instId") == CFG.symbol and abs(float(p.get("pos", 0))) > 0
+                                        for p in pos_resp.get("data", [])
+                                    )
+                                    if has_sym_pos:
+                                        # 交易所还有仓位 → 入场单已成交，仓位正常，清理pending_ord_id
+                                        with lock:
+                                            pos.pending_ord_id = ""
+                                        log.debug(f"🔍 [{CFG.symbol}] pending_ord状态={ord_state}，交易所仍有仓位 → 清理pending_ord_id")
+                                    else:
+                                        # 交易所无仓位 → 仓位已平（SL触发或手动平仓），同步本地状态
+                                        log.warning(f"⚠️ [{CFG.symbol}] pending_ord={ord_state}，交易所无持仓，同步本地状态")
+                                        self.trader.state._reset_pos()
+                                else:
+                                    log.debug(f"[{CFG.symbol}] 验证交易所仓位失败: {pos_resp}")
                         else:
-                            # API失败时跳过本次检查，不影响其他逻辑
                             log.debug(f"[{CFG.symbol}] 查询pending_ord状态失败: {status}")
                     except Exception as e:
                         log.debug(f"[{CFG.symbol}] SL验证异常: {e}")
@@ -569,7 +599,7 @@ class RiskGuard:
                 trailing_dist = pos.trailing_dist_atr_mult * atr / price  # AI 动态指定
             else:
                 # 震荡市放宽：1.2→1.5 ATR，震荡激进 1.5→1.8 ATR，趋势保持 2.0
-                _td_mult = 2.2 if market_mode == "趋势" else (2.0 if market_mode == "震荡激进" else 1.8)
+                _td_mult = 2.5 if market_mode == "趋势" else (2.5 if market_mode == "震荡激进" else 2.2)
                 trailing_dist = _td_mult * atr / price
                 # 最低价距兜底：ATR极小时至少 0.15%，防止正常噪声扫损
                 trailing_dist = max(trailing_dist, 0.0015)
