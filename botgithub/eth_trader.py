@@ -2495,6 +2495,8 @@ class ETHTrader:
         # ── Fast Decision 上下文（signal_hint 非绑定参考）────────────────────
         _fast_context = ""
         if fast_decision is not None:
+            # 规则引擎信号置信度上限，防止绕过 AI 决策
+            fast_decision["confidence"] = min(fast_decision.get("confidence", 0.5), 0.72)
             _fd_src = fast_decision.get("thought_process", "")
             _fd_act = fast_decision["action"]
             _fd_dir = "short" if _fd_act == "open_short" else "long"
