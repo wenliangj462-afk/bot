@@ -36,7 +36,8 @@ def calc_liq_price(side: str, entry: float, leverage: int, balance: float,
                    size: float, ct_val: float) -> float:
     """
     计算逐仓强平价（OKX 简化公式 + 缓冲）
-    - 考虑维持保证金率 (MMR=0.4%)
+    - 逐仓模式下，强平发生在亏损 ≈ 保证金 - 维持保证金时
+    - 强平距离 ≈ (1 - MMR) / leverage
     - 增加 0.1% 缓冲以覆盖手续费/滑点影响
     """
     if entry <= 0 or leverage <= 0:
@@ -44,9 +45,9 @@ def calc_liq_price(side: str, entry: float, leverage: int, balance: float,
     mmr = 0.004       # 维持保证金率 0.4%
     buffer = 0.001    # 额外缓冲 0.1%，覆盖手续费和滑点
     if side == "long":
-        return entry * (1 - (mmr + buffer) / leverage)
+        return entry * (1 - (1 - mmr + buffer) / leverage)
     else:
-        return entry * (1 + (mmr + buffer) / leverage)
+        return entry * (1 + (1 - mmr + buffer) / leverage)
 
 class OrderFailedError(Exception):
     """订单失败异常"""
@@ -88,8 +89,8 @@ class PositionExec:
             _fc_data     = self.trader.funding_cache.get("data") or {}
             funding_rate = _fc_data.get("funding_rate", 0)
 
-            # ── 冷却：至少间隔 60s（小资金足够，减少AI调用）─────────────────
-            if (datetime.now(UTC) - self.trader._last_adjust_time).total_seconds() < 60:
+            # ── 冷却：至少间隔 120s（减少AI过度干预，让规则多拿一会儿）─────────
+            if (datetime.now(UTC) - self.trader._last_adjust_time).total_seconds() < 120:
                 return
             # ── 追踪止损 AI 调整冷却：每 3 分钟才允许一次 ──────────────────
             if (datetime.now(UTC) - self.trader._last_trailing_adjust).total_seconds() < 180:
@@ -614,12 +615,13 @@ class PositionExec:
                 lev = auto_lev
                 max_by_margin = int(effective_bal * lev / (price * ct_val))
 
-        # 小资金账户自动提高保证金使用率
+        # 小资金保证金使用率保护：低于150U时收紧上限，留足缓冲防强平
         if effective_bal < 150:
-            effective_cap_pct = max(CFG.max_margin_pct, 0.70)
+            effective_max_margin = 0.48
+            log.warning(f"🛡️ [{sym}] 小资金保护: effective_bal={effective_bal:.1f}U <150, 保证金上限收紧至 {effective_max_margin*100:.0f}%")
         else:
-            effective_cap_pct = CFG.max_margin_pct
-        max_margin_budget = min(single_cap, equity_for_cap * effective_cap_pct)
+            effective_max_margin = CFG.max_total_margin_ratio
+        max_margin_budget = min(single_cap, equity_for_cap * effective_max_margin)
         max_size_by_margin_cap = max(int(max_margin_budget * lev / (ct_val * price + 1e-9)), 1)
 
         # 计算张数（使用 Kelly 公式优化仓位）
@@ -700,6 +702,11 @@ class PositionExec:
             _vs_frozen_ts = dec.get("_vs_score_mult_frozen_ts", 0.0)
             if _vs_frozen_ts > 0 and (time.monotonic() - _vs_frozen_ts) > 90.0:
                 _vs_score_mult = 0.0  # 过期清除
+            # 修复：冻结值过期或为 0 时，回退到实时 VSpike 状态
+            if _vs_score_mult == 0.0:
+                _vs_live = self.trader.vspike.get_status()
+                if _vs_live.get("is_spike") or _vs_live.get("spike_recent"):
+                    _vs_score_mult = _vs_live.get("mult", 0.0)
 
             _near_level  = False
             if ind_15m:
@@ -711,6 +718,8 @@ class PositionExec:
                 if _res > 0 and abs(_price_cs - _res) / _price_cs < 0.003:
                     _near_level = True
 
+            # 获取实时 VSpike 状态，传入 ConvictionScorer 供极端保底分判断
+            _vs_live_ctx = self.trader.vspike.get_status()
             _conviction = self.trader._conviction.score(
                 ai_conf      = ai_conf,
                 action       = dec.get("action", "open_long"),
@@ -722,6 +731,9 @@ class PositionExec:
                 context      = {
                     "atr_ratio": (ind_15m or {}).get("atr_ratio", 1.0),
                     "trend_alignment_score": trend_score,
+                    "flow_direction": _vs_live_ctx.get("direction", ""),
+                    "cvd_delta": _vs_live_ctx.get("cum_delta", 0.0),
+                    "buy_pct": _vs_live_ctx.get("buy_pct", 0.5),
                 },
             )
             _cv_score      = _conviction["score"]
@@ -742,11 +754,11 @@ class PositionExec:
             # VSpike 越强，阈值越低，允许边缘信号在高成交量确认时下注
             _base_thresh = CFG.osc_conviction_min if market_mode in ("震荡", "震荡激进") else CFG.conviction_open_min
             if _vs_score_mult >= 6.0:
-                _cv_thresh = max(35.0, _base_thresh - 12.0)  # VSpike≥6x：阈值 -12
+                _cv_thresh = max(40.0, _base_thresh - 12.0)  # VSpike≥6x：阈值 -12
             elif _vs_score_mult >= 4.0:
-                _cv_thresh = max(38.0, _base_thresh - 8.0)   # VSpike≥4x：阈值 -8
+                _cv_thresh = max(43.0, _base_thresh - 8.0)   # VSpike≥4x：阈值 -8（震荡市实际47→39，已验证太松）
             elif _vs_score_mult >= 3.0:
-                _cv_thresh = max(40.0, _base_thresh - 4.0)   # VSpike≥3x：阈值 -4
+                _cv_thresh = max(45.0, _base_thresh - 4.0)   # VSpike≥3x：阈值 -4
             else:
                 _cv_thresh = _base_thresh                     # 无 VSpike：基准阈值
             # ────────────────────────────────────────────────────────────────
@@ -775,6 +787,12 @@ class PositionExec:
                 final_risk_mult = kelly_f * effective_risk_mult * slippage_mult * _bypass_k
                 delattr(self.trader, '_bypass_kelly_override')
                 log.debug(f"⚡ [{sym}] BypassLane kelly override: {_bypass_k:.2f}")
+            # VSpike 活跃时折扣：避免突发量能直接把保证金推到上限
+            _vs_discount = dec.get("_vs_score_mult_frozen", 0.0)
+            if _vs_discount >= 3.0:
+                _vs_disc_factor = 0.75
+                final_risk_mult *= _vs_disc_factor
+                log.info(f"🔥 [{sym}] VSpike折扣: {_vs_discount:.1f}x → final_risk×{_vs_disc_factor:.2f}")
             risk_per_trade_dynamic = final_risk_mult
             # ── 软拦截降仓位（近关键位降权 + SL 收紧，同步生效）────────────────
             _near_mult = dec.get("near_level_mult", 1.0) if isinstance(dec, dict) else 1.0
@@ -1319,7 +1337,8 @@ class PositionExec:
                 current_trade_id = pos.trade_id
             if current_trade_id:
                 try:
-                    update_trade_close(current_trade_id, exit_price, close_reason=reason, leverage=leverage_snapshot)
+                    update_trade_close(current_trade_id, exit_price, close_reason=reason,
+                                       leverage=leverage_snapshot, pnl=pnl, pnl_pct=pnl_pct)
                     with lock:
                         if pos.trade_id == current_trade_id:  # 防竞态
                             pos.trade_id = None
@@ -1508,10 +1527,23 @@ class PositionExec:
                             current_trade_id  = pos.trade_id
                             _recon_leverage   = pos.leverage if pos.leverage > 0 else 1
                         if current_trade_id and reconstructed_exit > 0:
-                            update_trade_close(current_trade_id, reconstructed_exit, leverage=_recon_leverage)
+                            # 计算补写 pnl
+                            if entry_snapshot > 0:
+                                _recon_pnl_pct = (
+                                    (reconstructed_exit - entry_snapshot) / entry_snapshot
+                                    if side_snapshot == "long"
+                                    else (entry_snapshot - reconstructed_exit) / entry_snapshot
+                                )
+                                _recon_pnl = _recon_pnl_pct * _recon_leverage
+                            else:
+                                _recon_pnl_pct, _recon_pnl = None, None
+                            update_trade_close(current_trade_id, reconstructed_exit,
+                                               leverage=_recon_leverage,
+                                               pnl=_recon_pnl, pnl_pct=_recon_pnl_pct)
                             with lock:
                                 pos.trade_id = None
-                            log.info(f"📋 已补写平仓记录 trade_id={current_trade_id} exit={reconstructed_exit:.4f}")
+                            log.info(f"📋 已补写平仓记录 trade_id={current_trade_id} exit={reconstructed_exit:.4f}"
+                                     f" pnl={(_recon_pnl_pct or 0)*100:+.2f}%")
 
                             # 补计已实现盈亏
                             ct_val = self.okx.contract_sizes.get(sym, 0.01)
