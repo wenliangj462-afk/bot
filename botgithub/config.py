@@ -59,7 +59,6 @@ _CFG_FIELD_MAP: Dict[str, tuple] = {
     "REASONER_CONSEC_LOSS_THRESH":   ("reasoner_consec_loss_thresh",   int,   2,     6),
     "REASONER_ROE_THRESH":            ("reasoner_roe_thresh",          float, -0.25, -0.05),
     "REASONER_ATR_RATIO_THRESH":     ("reasoner_atr_ratio_thresh",    float, 1.2,   2.5),
-    "REASONER_STOP_COOLDOWN_SEC":    ("reasoner_stop_cooldown_sec",    int,   600,   3600),
     "TIME_STOP_MINUTES":         ("time_stop_minutes",         int),
     "OSC_AGGRESSIVE_ADX_THRESH": ("osc_aggressive_adx_thresh", float),
     "SL_MIN_ATR_MULT":           ("sl_min_atr_mult",           float),
@@ -220,10 +219,7 @@ class BotConfig:
     ai_retry_delay:         float = float(os.getenv("AI_RETRY_DELAY", "5"))
     ai_timeout_alert_count: int   = int(os.getenv("AI_TIMEOUT_ALERT_COUNT", "3"))
     ai_min_request_interval: int = int(os.getenv("AI_MIN_REQUEST_INTERVAL", "10"))
-    committee_ai_weight:       float = float(os.getenv("COMMITTEE_AI_WEIGHT", "0.7"))
-    committee_atr_weight:      float = float(os.getenv("COMMITTEE_ATR_WEIGHT", "0.15"))
-    committee_rsi_weight:      float = float(os.getenv("COMMITTEE_RSI_WEIGHT", "0.15"))
-    committee_vol_weight:      float = float(os.getenv("COMMITTEE_VOL_WEIGHT", "0.0"))
+    # 策略委员会（已废弃，保留 committee_enabled 向下兼容）
     committee_enabled:        bool  = os.getenv("COMMITTEE_ENABLED", "true").lower() == "true"
     max_hold_silence_minutes: int   = int(os.getenv("MAX_HOLD_SILENCE_MINUTES", "15"))
     silence_force_wakeup_loss_pct:  float = float(os.getenv("SILENCE_FORCE_WAKEUP_LOSS_PCT", "-3.0"))
@@ -239,7 +235,6 @@ class BotConfig:
     reasoner_consec_loss_thresh: int   = int(os.getenv("REASONER_CONSEC_LOSS_THRESH",   "3"))
     reasoner_roe_thresh:         float = float(os.getenv("REASONER_ROE_THRESH",          "-0.15"))
     reasoner_atr_ratio_thresh:   float = float(os.getenv("REASONER_ATR_RATIO_THRESH",  "1.8"))
-    reasoner_stop_cooldown_sec:   int   = int(os.getenv("REASONER_STOP_COOLDOWN_SEC",   "2400"))
     # ── SL ATR 自适应参数（各市场模式 floor/cap）─────────────────────────────
     sl_atr_floor_osc_aggr: float = float(os.getenv("SL_ATR_FLOOR_OSC_AGGR", "0.8"))
     sl_atr_cap_osc_aggr:    float = float(os.getenv("SL_ATR_CAP_OSC_AGGR",    "2.2"))
@@ -289,6 +284,7 @@ class BotConfig:
     vspike_escape_level1:  float = float(os.getenv("VSPIKE_ESCAPE_LEVEL1",  "4.0"))
     vspike_escape_level2:  float = float(os.getenv("VSPIKE_ESCAPE_LEVEL2",  "5.0"))
     vspike_extreme_mult:   float = float(os.getenv("VSPIKE_EXTREME_MULT",   "10.0"))
+    vspike_silence_break_cd: int  = int(os.getenv("VSPIKE_SILENCE_BREAK_CD", "180"))  # 非极端VSpike打破静默最小间隔(秒)
     vspike_escape_baseline: float = float(os.getenv("VSPIKE_ESCAPE_BASELINE", "20.0"))
     escape_loss_min:       float = float(os.getenv("ESCAPE_LOSS_MIN",       "0.005"))
     profit_protect_thresh: float = float(os.getenv("PROFIT_PROTECT_THRESH", "0.01"))
