@@ -390,16 +390,35 @@ def get_all_pending_orders() -> List[Dict]:
 def update_trade_close(trade_id: int, exit_price: float, close_reason: str = "",
                        leverage: int = 1, pnl: float = None, pnl_pct: float = None,
                        fail_reason: str = None):
-    """更新交易平仓信息"""
+    """更新交易平仓信息（含 close_ts、pnl 回填）"""
+    close_ts = datetime.now(UTC).isoformat()
     for attempt in range(3):
         try:
             conn = get_db_conn()
-            if pnl is not None:
-                conn.execute("UPDATE trades SET exit=?, close_reason=?, pnl=?, pnl_pct=? WHERE id=?",
-                             (exit_price, close_reason, pnl, pnl_pct, trade_id))
+            # 若调用方未传 pnl，根据 entry/exit/side 自动计算（防止 pnl=NULL 的幸存者偏差）
+            _pnl = pnl
+            _pnl_pct = pnl_pct
+            if _pnl is None and exit_price > 0:
+                c = conn.cursor()
+                c.execute("SELECT side, entry FROM trades WHERE id=?", (trade_id,))
+                row = c.fetchone()
+                if row and row[1] and row[1] > 0:
+                    side, entry = row
+                    if side == "long":
+                        _pnl_pct = (exit_price - entry) / entry
+                    elif side == "short":
+                        _pnl_pct = (entry - exit_price) / entry
+                    if _pnl_pct is not None:
+                        _pnl = _pnl_pct * leverage  # 含杠杆的实际盈亏比例
+                        log.debug(f"[DB] trade#{trade_id} pnl 自动回填: side={side} entry={entry:.2f} exit={exit_price:.2f} pnl_pct={_pnl_pct*100:.2f}%")
+            if _pnl is not None:
+                conn.execute(
+                    "UPDATE trades SET exit=?, close_ts=?, close_reason=?, pnl=?, pnl_pct=? WHERE id=?",
+                    (exit_price, close_ts, close_reason, _pnl, _pnl_pct, trade_id))
             else:
-                conn.execute("UPDATE trades SET exit=?, close_reason=? WHERE id=?",
-                             (exit_price, close_reason, trade_id))
+                conn.execute(
+                    "UPDATE trades SET exit=?, close_ts=?, close_reason=? WHERE id=?",
+                    (exit_price, close_ts, close_reason, trade_id))
             conn.commit()
             return
         except Exception as e:
@@ -451,23 +470,101 @@ def _auto_generate_historical_case(trade_id: int, ai_client, pos_snapshot: Dict)
     ).start()
 
 def _auto_gen_case_worker(trade_id: int, ai_client, pos_snapshot: Dict):
-    """自动案例生成的工作线程"""
+    """自动案例生成 → 评估质量 → 写入 historical_cases"""
     try:
         from common import _call_chat
-        prompt = f"""评估以下交易案例的质量，生成简短总结：
+        _pnl_pct = pos_snapshot.get('pnl_pct', 0)
+        _direction = pos_snapshot.get('direction', 'unknown')
+        _entry_mode = pos_snapshot.get('entry_market_mode', 'unknown')
+        _entry_rsi = pos_snapshot.get('entry_rsi', 0)
+        _ai_conf = pos_snapshot.get('ai_confidence', 0)
+        _ai_reason = pos_snapshot.get('ai_reason', '')
+        _hold_min = pos_snapshot.get('hold_minutes', 0)
 
-方向: {pos_snapshot.get('side', 'unknown')}
-入场模式: {pos_snapshot.get('entry_market_mode', 'unknown')}
-RSI: {pos_snapshot.get('entry_rsi', 0):.2f}
-盈亏: {pos_snapshot.get('pnl_pct', 0)*100:+.2f}%
-置信度: {pos_snapshot.get('ai_confidence', 0):.2f}
+        prompt = f"""你是量化交易案例评估专家。评估以下已平仓交易的案例质量。
 
-生成5-10字的质量评分标签，如"高质量趋势跟踪"或"低质量震荡交易"。"""
+方向: {_direction}
+入场模式: {_entry_mode}
+入场RSI: {_entry_rsi:.1f} | BB%: {pos_snapshot.get('entry_bb_pct', 0.5):.2f}
+盈亏: {_pnl_pct*100:+.2f}% | 持仓: {_hold_min:.0f}分钟
+AI置信度: {_ai_conf:.2f}
+AI理由: {(_ai_reason or '无')[:100]}
+
+请用JSON回复（无其他文字）：
+{{"quality_score": <1-10的浮点数>, "core_reason": "<15字以内的核心总结>"}}
+
+评分标准：
+- 9-10: 完美执行（趋势跟踪盈利>3%，或精准止损<-1%）
+- 7-8: 合格交易（方向正确，风控到位）
+- 5-6: 一般（盈亏不大，参考价值有限）
+- 1-4: 低质量（逆势、过度持仓、无效止损）"""
+
         response = _call_chat(ai_client, [{"role": "user", "content": prompt}],
-                             max_tokens=50, timeout=20)
-        log.debug(f"[RAG] 案例 {trade_id} 自动标签: {response[:30] if response else '无'}")
+                             max_tokens=80, timeout=20)
+        if not response:
+            log.debug(f"[案例池] trade#{trade_id} AI评估无响应，跳过")
+            return
+
+        # 解析 AI 返回的 JSON
+        import re
+        _json_match = re.search(r'\{[^}]+\}', response)
+        if not _json_match:
+            log.debug(f"[案例池] trade#{trade_id} AI返回非JSON: {response[:50]}")
+            return
+        _parsed = json.loads(_json_match.group())
+        q_score = float(_parsed.get("quality_score", 5.0))
+        core_reason = str(_parsed.get("core_reason", ""))[:50]
+
+        # 质量门槛检查
+        _threshold = getattr(CFG, 'rag_case_quality_threshold', 7.5)
+        if q_score < _threshold:
+            log.debug(f"[案例池] trade#{trade_id} 质量分={q_score:.1f} < {_threshold}，不入池")
+            return
+
+        # 写入 historical_cases 表
+        _result = "win" if _pnl_pct > 0 else "loss"
+        conn = get_db_conn()
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO historical_cases
+                (timestamp, symbol, direction, entry_price, exit_price,
+                 pnl_pct, pnl_usd, hold_minutes,
+                 market_mode, entry_rsi, entry_bb_pct, entry_atr_pct,
+                 exit_rsi, exit_bb_pct, exit_atr_pct,
+                 ai_confidence, ai_decision_reason,
+                 actual_result, quality_score, core_reason)
+            VALUES (?, ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?,
+                    ?, ?, ?)
+        """, (
+            datetime.now(UTC).isoformat(),
+            pos_snapshot.get('symbol', 'ETH-USDT-SWAP'),
+            _direction,
+            pos_snapshot.get('entry_price', 0),
+            pos_snapshot.get('exit_price', 0),
+            _pnl_pct,
+            pos_snapshot.get('pnl_usd', 0),
+            _hold_min,
+            _entry_mode,
+            _entry_rsi,
+            pos_snapshot.get('entry_bb_pct', 0.5),
+            pos_snapshot.get('entry_atr_pct', 0.5),
+            pos_snapshot.get('exit_rsi', 0),
+            pos_snapshot.get('exit_bb_pct', 0.5),
+            pos_snapshot.get('exit_atr_pct', 0.5),
+            _ai_conf,
+            (_ai_reason or '')[:300],
+            _result,
+            q_score,
+            core_reason,
+        ))
+        conn.commit()
+        log.info(f"[案例池] ✅ trade#{trade_id} 入池 | {_result} | q={q_score:.1f} | {core_reason}")
     except Exception as e:
-        log.debug(f"[RAG] 自动案例生成异常: {e}")
+        log.debug(f"[案例池] 自动案例生成异常: {e}")
 
 # ============================================================
 # Bot 实例弱引用（全局单例）
@@ -1299,7 +1396,8 @@ def retrieve_similar_failures(current_rsi: float, current_trend: str,
             )
             rows = c.fetchall()
             if not rows:
-                return []
+                log.debug("[案例池] historical_cases 无匹配，fallback 到旧模式")
+                raise ValueError("案例池为空，触发 fallback")  # 跳入 except → 走旧逻辑
             scored = []
             for r in rows:
                 ts, direction, e_rsi, e_bb, e_atr, mode, result, pnl, q_score, core, reason = r
