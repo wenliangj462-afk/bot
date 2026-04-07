@@ -644,6 +644,38 @@ class ConvictionScorer:
               market_mode:  str   = "趋势",
               context:       Dict  = None,
     ) -> Dict:
+        ctx = context or {}
+
+        # ── 极端量能逃生通道：VSpike ≥ 15x 且方向明确时，保底分 55 ──
+        _extreme_vspike = vspike_mult >= 15.0
+        if _extreme_vspike:
+            _buy_pct = ctx.get("buy_pct", 0.5)
+            # 方向明确判定：买方主导(buy_pct≥80%) 或 卖方主导(buy_pct≤20%)
+            # buy_pct 来自实际成交占比（真金白银），比挂单簿更可靠
+            _direction_clear = (_buy_pct >= 0.80 or _buy_pct <= 0.20)
+            _flow_dir = ctx.get("flow_direction", "")
+            _vs_direction_ok = (
+                (action == "open_long" and _buy_pct >= 0.80) or
+                (action == "open_short" and _buy_pct <= 0.20)
+            )
+            # 方向确认：成交占比极端 + 方向与开仓动作一致
+            direction_confirmed = _direction_clear and _vs_direction_ok
+            if direction_confirmed:
+                return {
+                    "score":       55.0,
+                    "kelly_ratio": 0.55,
+                    "env_mult":    1.0,
+                    "risk_mult":   1.0,
+                    "components": {
+                        "ai_raw":      0,
+                        "spike":       vspike_mult,
+                        "ob":          ob_imbalance,
+                        "level":       8.0 if at_key_level else 0.0,
+                        "rsi_penalty": 0.0,
+                    },
+                    "extreme_bypass": True,
+                }
+
         # ── 硬门槛：AI 置信度不足直接打回 ──
         if ai_conf < 0.55:
             return {
@@ -852,6 +884,7 @@ class SmartAIConsultant:
                               prev_market_mode: Optional[str] = None,
                               sentiment_alert: str = "",
                               fast_context: str = "",
+                              aggressive_context: str = "",
                               # ── 预计算值（由 get_decision 顶部算好再传入，避免重复计算）──
                               _osc_market: Optional[str] = None,
                               _period_score: Optional[float] = None,
@@ -923,6 +956,38 @@ class SmartAIConsultant:
         # kline
         kline_str = build_kline_series(ind_15m, ind_1h, n_15m=8, n_1h=4)
 
+        # ===== [微观] 区块：VSpike / 盘口微观结构 =====
+        # 注：详细 CVD/吃单流量 数据已通过 fast_context 传入，此处仅提取 ind_15m/depth 可直接获取的微观信号
+        _vs_mult = ind_15m.get('vol_surge', 1.0)
+        _vs_is_spike = _vs_mult >= float(getattr(CFG, 'v_spike_mult_thresh', 2.9))
+        _imbal = depth.get('imbalance', 0)
+        _sr = depth.get('slope_ratio', 1.0)
+        _bwm = depth.get('bid_wall_mult', 0.0)
+        _awm = depth.get('ask_wall_mult', 0.0)
+        _bwd = depth.get('bid_wall_dist_pct', 0.0)
+        _awd = depth.get('ask_wall_dist_pct', 0.0)
+        _imbal_n = depth.get('imbal_near', 0.0)
+
+        micro_lines = []
+        # VSpike
+        micro_lines.append(f"VSpike={_vs_mult:.1f}x{' 🔥突增' if _vs_is_spike else ''}")
+        # OB 微观结构
+        _ob_wall_t = float(getattr(CFG, 'ob_wall_mult', 3.5))
+        if _awm >= _ob_wall_t and _awd < 0.003:
+            micro_lines.append(f"🧱 卖方冰山墙:距{_awd*100:.2f}% 强度{_awm:.1f}x 慎追多")
+        if _bwm >= _ob_wall_t and _bwd < 0.003:
+            micro_lines.append(f"🧱 买方支撑墙:距{_bwd*100:.2f}% 强度{_bwm:.1f}x 有利做多")
+        if _sr >= 1.4:
+            micro_lines.append(f"📈 OB买方斜率(ratio={_sr:.2f})")
+        elif _sr <= 0.65:
+            micro_lines.append(f"📉 OB卖方斜率(ratio={_sr:.2f})")
+        if abs(_imbal_n) > 0.20:
+            micro_lines.append(f"近场失衡:{_imbal_n:+.3f} {'买方压制' if _imbal_n > 0 else '卖方压制'}")
+        # 盘口失衡速报
+        micro_lines.append(f"盘口失衡:{_imbal:+.2f}")
+
+        micro_block = "\n".join(micro_lines)
+
         bw = depth.get('bid_wall_mult', 0)
         sw = depth.get('ask_wall_mult', 0)
         bw_d = depth.get('bid_wall_dist_pct', 0)
@@ -932,30 +997,34 @@ class SmartAIConsultant:
         if sw > 0: wall_str += f"卖墙:{sw:.1f}x {sw_d*100:.1f}%距"
 
         user_prompt = (
+            f"{aggressive_context}"
             f"你是ETH量化交易顾问。根据以下指标判断交易动作。\n\n"
-            f"[指标]\n"
-            f"[15m] rsi={ind_15m.get('rsi',50):.1f} macd={ind_15m.get('macd_hist',0):.4f} "
-            f"bb%={ind_15m.get('bb_pct',0.5):.2f} vol={ind_15m.get('vol_surge',1):.2f}x "
-            f"trend={ind_15m.get('trend','?')} div={ind_15m.get('divergence','无')}\n"
-            f"[1h]  rsi={ind_1h.get('rsi',50):.1f} macd={ind_1h.get('macd_hist',0):.4f} ema={ind_1h.get('ema_bull','?')}\n"
-            f"[4h]  rsi={ind_4h.get('rsi',50):.1f} macd={ind_4h.get('macd_hist',0):.4f} ema={ind_4h.get('ema_bull','?')}\n"
-            f"现价:{price_now:.2f} | 市场:{_market_mode}(BB={_bb_w*100:.1f}%) | 评分:{score_desc}({sc:.2f}) | {mode_hint}\n"
-            f"VSpike={ind_15m.get('vol_surge',1):.1f}x | 恐贪={fg_index.get('value',50)} | 资金费={funding.get('funding_rate',0)*100:+.3f}%\n"
-            f"{levels_str if levels_str else '关键位:暂无'}\n\n"
+            f"[微观]{micro_block}\n\n"
+            f"[盘口] 失衡={_imbal:.2f} 斜率={_sr:.2f} {wall_str}\n\n"
             f"[K线序列]{kline_str}\n\n"
-            f"[盘口] 失衡={depth.get('imbalance',0):.2f} 斜率={depth.get('slope_ratio',1.0):.2f} {wall_str}\n\n"
             f"[持仓]{pos_str}\n"
             f"{stop_block}\n"
             f"{fast_context}\n"
             + (f"[历史案例]{rag_warning}\n\n" if rag_warning else "\n")
             + f"{pos_block}\n\n"
+            f"[指标](参考)\n"
+            f"[15m] rsi={ind_15m.get('rsi',50):.1f} macd={ind_15m.get('macd_hist',0):.4f} "
+            f"bb%={ind_15m.get('bb_pct',0.5):.2f} trend={ind_15m.get('trend','?')} div={ind_15m.get('divergence','无')}\n"
+            f"[1h]  rsi={ind_1h.get('rsi',50):.1f} macd={ind_1h.get('macd_hist',0):.4f} ema={ind_1h.get('ema_bull','?')}\n"
+            f"[4h]  rsi={ind_4h.get('rsi',50):.1f} macd={ind_4h.get('macd_hist',0):.4f} ema={ind_4h.get('ema_bull','?')}\n"
+            f"现价:{price_now:.2f} | 市场:{_market_mode}(BB={_bb_w*100:.1f}%) | 评分:{score_desc}({sc:.2f}) | {mode_hint}\n"
+            f"恐贪={fg_index.get('value',50)} | 资金费={funding.get('funding_rate',0)*100:+.3f}%\n"
+            f"{levels_str if levels_str else '关键位:暂无'}\n\n"
             f"[决策原则]\n"
-            f"1.规则引擎信号仅作参考，你可自由否决。若数据不支持（RSI/盘口/量能矛盾），直接hold。\n"
-            f"2.方向中性：只看信号强度，不追涨杀跌。\n"
-            f"3.止损必给：open必须同时给suggested_sl和suggested_tp。\n"
-            f"4.关键位锚定：止损优先锚定最近支撑/阻力，再考虑ATR。\n"
-            f"5.数据自洽：说超买需RSI>=70(震荡>=65)，背离需div=bullish/bearish。\n"
-            f"6.趋势市顺势追击，震荡市均值回归。\n\n"
+            f"1.微观优先：VSpike/盘口/OB结构是第一信号，宏观指标仅作确认。\n"
+            f"2.若微观数据矛盾（如VSpike突增但盘口失衡中性/反向），直接hold。\n"
+            f"3.极端量能(>10x)时优先结合CVD/流量方向表态，不要因为RSI超买/超卖就hold。\n"
+            f"4.规则引擎信号仅作参考，你可自由否决。若数据不支持（RSI/盘口/量能矛盾），直接hold。\n"
+            f"4.方向中性：只看信号强度，不追涨杀跌。\n"
+            f"5.止损必给：open必须同时给suggested_sl和suggested_tp。\n"
+            f"6.关键位锚定：止损优先锚定最近支撑/阻力，再考虑ATR。\n"
+            f"7.数据自洽：说超买需RSI>=70(震荡>=65)，背离需div=bullish/bearish。\n"
+            f"8.趋势市顺势追击，震荡市均值回归。\n\n"
             f"只输出JSON:\n"
             f'{{"action":"","confidence":0.0~1.0,"suggested_sl":数值,"suggested_tp":数值,'
             f'"suggested_leverage":1~{CFG.max_leverage},"reason":"一句话","wait_seconds":0~300}}'
@@ -986,19 +1055,48 @@ class SmartAIConsultant:
             allowed_actions = ["hold", "open_long", "open_short"]
             pos_block = "空仓"
 
+        # ===== [微观] 区块：VSpike / 吃单流量 / CVD / OB结构 =====
+        _vs_mult_r = ind_15m.get('vol_surge', 1.0)
+        _vs_spike_r = _vs_mult_r >= float(getattr(CFG, 'v_spike_mult_thresh', 2.9))
+        _imbal_r = depth.get('imbalance', 0)
+        _sr_r = depth.get('slope_ratio', 1.0)
+        _bwm_r = depth.get('bid_wall_mult', 0.0)
+        _awm_r = depth.get('ask_wall_mult', 0.0)
+        _bwd_r = depth.get('bid_wall_dist_pct', 0.0)
+        _awd_r = depth.get('ask_wall_dist_pct', 0.0)
+        _imbal_n_r = depth.get('imbal_near', 0.0)
+
+        micro_lines_r = []
+        micro_lines_r.append(f"VSpike={_vs_mult_r:.1f}x{' 🔥突增' if _vs_spike_r else ''}")
+        if _vs_spike_r:
+            micro_lines_r.append(f"  方向:{ind_15m.get('trend','?')}(买占50%+?需结合CVD)")
+        if _sr_r >= 1.4:
+            micro_lines_r.append(f"📈 OB买方斜率(ratio={_sr_r:.2f})")
+        elif _sr_r <= 0.65:
+            micro_lines_r.append(f"📉 OB卖方斜率(ratio={_sr_r:.2f})")
+        _ob_wall_t_r = float(getattr(CFG, 'ob_wall_mult', 3.5))
+        if _awm_r >= _ob_wall_t_r and _awd_r < 0.003:
+            micro_lines_r.append(f"🧱 卖方冰山墙:距{_awd_r*100:.2f}% 强度{_awm_r:.1f}x")
+        if _bwm_r >= _ob_wall_t_r and _bwd_r < 0.003:
+            micro_lines_r.append(f"🧱 买方支撑墙:距{_bwd_r*100:.2f}% 强度{_bwm_r:.1f}x")
+        if abs(_imbal_n_r) > 0.20:
+            micro_lines_r.append(f"近场失衡:{_imbal_n_r:+.3f}")
+        micro_block_r = "\n".join(micro_lines_r)
+
         user_prompt = (
             f"你是ETH量化交易顾问。请仔细分析以下指标，决定交易动作。\n\n"
+            f"[微观]{micro_block_r}\n\n"
+            f"[盘口] 失衡={_imbal_r:.2f} 斜率={_sr_r:.2f}\n\n"
+            f"[持仓]{pos_block}\n\n"
+            f"{fast_context}\n\n"
+            f"[指标](参考)\n"
             f"[15m] rsi={ind_15m.get('rsi',50):.1f} macd={ind_15m.get('macd_hist',0):.4f} "
-            f"bb%={ind_15m.get('bb_pct',0.5):.2f} vol={ind_15m.get('vol_surge',1):.2f}x "
-            f"trend={ind_15m.get('trend','?')} div={ind_15m.get('divergence','无')} "
-            f"adx={ind_15m.get('adx',25):.1f}\n"
+            f"bb%={ind_15m.get('bb_pct',0.5):.2f} adx={ind_15m.get('adx',25):.1f}\n"
             f"[1h]  rsi={ind_1h.get('rsi',50):.1f} macd={ind_1h.get('macd_hist',0):.4f} ema_bull={ind_1h.get('ema_bull','?')}\n"
             f"[4h]  rsi={ind_4h.get('rsi',50):.1f} macd={ind_4h.get('macd_hist',0):.4f} ema_bull={ind_4h.get('ema_bull','?')}\n"
-            f"现价:{price_now:.2f} | 市场:{_market_mode}(BB={_bb_w*100:.1f}%) | VSpike={ind_15m.get('vol_surge',1):.1f}x\n"
-            f"资金费={funding.get('funding_rate',0)*100:+.3f}% | 盘口失衡={depth.get('imbalance',0):.2f}\n"
-            f"{fast_context}\n\n"
-            f"[持仓]{pos_block}\n\n"
-            f"[决策原则] 规则引擎信号仅作参考，若数据不支持（RSI/盘口/量能矛盾）直接否决。深度思考后输出。\n\n"
+            f"现价:{price_now:.2f} | 市场:{_market_mode}(BB={_bb_w*100:.1f}%)\n"
+            f"资金费={funding.get('funding_rate',0)*100:+.3f}%\n\n"
+            f"[决策原则] 微观数据(VSpike/流量/OB)优先，宏观指标仅作确认。极端量能(>10x)时优先结合CVD/流量方向表态，不要因RSI超买/超卖就hold。规则引擎信号仅作参考，若数据不支持直接否决。深度思考后输出。\n\n"
             f"[可选动作]{', '.join(allowed_actions)}\n\n"
             f"深度思考后输出JSON，不要任何解释文字:\n"
             f'{{"action":"","confidence":0.0~1.0,"suggested_sl":数值,"suggested_tp":数值,'
@@ -1304,6 +1402,7 @@ class SmartAIConsultant:
                      prev_market_mode: str = None,
                      sentiment_alert: str = "",
                      fast_context: str = "",
+                     aggressive_context: str = "",
                      trend_alignment_score: float = 0.5,
                      trend_dir: str = "neutral") -> Dict:
         """
@@ -1339,6 +1438,7 @@ class SmartAIConsultant:
                     macro_context, rag_warning, market_sentiment,
                     prev_market_mode, sentiment_alert,
                     fast_context=fast_context,
+                    aggressive_context=aggressive_context,
                     _osc_market=_osc_pre, _period_score=_sc_pre, _score_desc=_desc_pre,
                 )
                 chat_temp = 0.35 if _osc_pre in ("震荡", "震荡激进") else 0.25
