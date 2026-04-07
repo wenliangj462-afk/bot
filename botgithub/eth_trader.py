@@ -362,7 +362,7 @@ class StateManager:
                 direction = "up" if self.trader.dynamic_risk_factor > old else "down"
                 log.info(
                     f"动态风险因子更新: {old:.2f}→{self.trader.dynamic_risk_factor:.2f} "
-                    f"（加权胜率={win_rate*100:.1f}% 样本=近{n}笔）"
+                    f"（胜率={win_rate*100:.1f}% 样本=近{n}笔）"
                 )
                 if self.trader.dynamic_risk_factor <= 0.6:
                     _webhook(
@@ -604,6 +604,9 @@ class ETHTrader:
         # ── close被拦截冷却（防同一VSpike事件触发Token死循环）─────────────
         # 格式：{symbol: {"spike_ts": float, "blocked_until": float}}
         self._blocked_close_ctx: Dict[str, Dict] = {}
+        # ── 非极端VSpike打破静默冷却（防震荡市密集触发浪费Token）────────────
+        # 格式：{symbol: monotonic时间戳}
+        self._last_vspike_break_ts: Dict[str, float] = {}
         # AI 平仓协调标志：防止 AI 平仓与追踪止损重复下单
         self._ai_close_pending_until: float = 0.0  # monotonic 时间戳
         # ── 决策去重签名（防相同决策每轮输出完整 thought_process）──────────
@@ -974,14 +977,26 @@ class ETHTrader:
             # 若是同一spike事件（peak_ts相同）且冷却期未过 → 跳过，不打破静默
             # VSpike 极端值 (≥10x) 豁免 close 拦截冷却
             _vs_mult_extreme = self.vspike.get_status().get("mult", 0.0)
+            _is_extreme = _vs_mult_extreme >= CFG.vspike_extreme_mult
             if (_bctx.get("spike_ts") == _spike_peak_ts
                     and _now_mono_vs < _bctx.get("blocked_until", 0)
-                    and _vs_mult_extreme < CFG.vspike_extreme_mult):  # 极端 VSpike 豁免冷却
+                    and not _is_extreme):  # 极端 VSpike 豁免冷却
                 _remain = _bctx["blocked_until"] - _now_mono_vs
                 log.debug(f"🛑 [{symbol}] close拦截冷却中（同一spike事件，剩余{_remain:.0f}s），跳过AI唤醒")
                 return True
-            if _vs_mult_extreme >= CFG.vspike_extreme_mult:
-                log.info(f"⚡ [{symbol}] VSpike 极端值 ({_vs_mult_extreme:.1f}x) 豁免 close 拦截冷却")
+            # ── 非极端VSpike打破静默冷却（防震荡市密集触发浪费Token）─────────
+            # 极端值(≥10x)无条件通过，普通spike需间隔 VSPIKE_SILENCE_BREAK_CD 秒
+            if not _is_extreme:
+                _last_break = self._last_vspike_break_ts.get(symbol, 0.0)
+                _cd = CFG.vspike_silence_break_cd
+                _elapsed = _now_mono_vs - _last_break
+                if _elapsed < _cd:
+                    _remain_cd = _cd - _elapsed
+                    log.debug(f"⏸️ [{symbol}] VSpike {_vs_mult_extreme:.1f}x 非极端，打破静默冷却中（剩余{_remain_cd:.0f}s），跳过")
+                    return True
+            if _is_extreme:
+                log.info(f"⚡ [{symbol}] VSpike 极端值 ({_vs_mult_extreme:.1f}x) 豁免所有冷却")
+            self._last_vspike_break_ts[symbol] = _now_mono_vs  # 记录本次打破静默时间
             log.info(f"🔥 [{symbol}] 秒级成交量突增，打破静默重新决策")
             self.fast_lane._clear_ai_cache(symbol=symbol)  # 强制清缓存，确保 AI 真实调用（而非返回旧 hold）
             # VSpike打破静默时同步清除BREAKOUT防抖缓存，防止同一轮打板信号因300s冷却被误杀
@@ -1330,28 +1345,28 @@ class ETHTrader:
                     # ── Prompt 注入极端量能特权指令 ───────────────────────────────
                     _ft_mult = self._ai_gate.entry_fasttrack_mult
                     if _ft_mult >= CFG.vspike_priority_threshold:
-                        _fasttrack_injection = (
-                            f"\n\n【⚡ 极端量能特权模式 VSpike={_ft_mult:.1f}x】\n"
+                        _aggressive_ctx = (
+                            f"【⚡ 极端量能特权模式 VSpike={_ft_mult:.1f}x】\n"
                             f"当前成交量是基准的{_ft_mult:.0f}倍，属于历史极值事件。\n"
                             f"决策指令：将订单流/成交量动力学权重提升至80%，"
                             f"RSI/MACD等滞后指标仅作辅助参考（权重≤20%）。\n"
                             f"若订单流方向明确（buy_pct>65%看多/buy_pct<35%看空），"
                             f"即使技术指标有背离，也应果断顺势决策。\n"
-                            f"conf可放宽至0.62以上即可开仓，系统将自动采用试探仓控制风险。"
+                            f"conf可放宽至0.62以上即可开仓，系统将自动采用试探仓控制风险。\n\n"
                         )
-                        _fc_combined = (fast_context or "") + _fasttrack_injection
                     else:
-                        _fc_combined = fast_context or ""
+                        _aggressive_ctx = ""
                     result = self.ai.get_decision(
                         _use_ind15, _use_ind1h, _use_ind4h, news_data, fg_index, funding, depth, pos_info,
                         key_levels=key_levels,
                         funding_history=funding_history or [],
+                        aggressive_context=_aggressive_ctx,
                         macro_context=macro_context,
                         rag_warning=rag_warning,
                         market_sentiment=market_sentiment,
                         prev_market_mode=self._market_mode,
                         sentiment_alert=sentiment_alert,
-                        fast_context=_fc_combined,
+                        fast_context=fast_context or "",
                         trend_alignment_score=_trend_score,
                         trend_dir=_trend_dir,
                     )
@@ -1471,7 +1486,7 @@ class ETHTrader:
 
         win_history = gs_get("ai_win_history", [])
         win_history.append(1 if is_win else 0)
-        win_history = win_history[-10:]
+        win_history = win_history[-25:]
         gs_set("ai_win_history", win_history)
 
         n = len(win_history)
@@ -2687,10 +2702,13 @@ class ETHTrader:
             _vs_frozen.get("is_spike") or _vs_frozen.get("spike_recent")
         ) else 0.0
         _vs_dir_fr = _vs_frozen.get("direction", "均衡")
-        _is_long_fr = decision.get("action", "") == "open_long"
+        _action_fr = decision.get("action", "")
+        _is_long_fr = _action_fr == "open_long"
+        _is_short_fr = _action_fr == "open_short"
+        # 仅在明确开仓动作时才检查方向对齐，hold/close 不参与 bonus 计算
         _vs_dir_ok_fr = (
             (_is_long_fr and _vs_dir_fr == "买方主导") or
-            (not _is_long_fr and _vs_dir_fr == "卖方主导")
+            (_is_short_fr and _vs_dir_fr == "卖方主导")
         )
         _vs_score_mult_fr = _vs_mult_fr if _vs_dir_ok_fr else 0.0
         # VSpike ≥6.0x bonus：仅方向对齐时才给 bonus，避免反向 Spike 误导开仓
@@ -2747,6 +2765,10 @@ class ETHTrader:
                         context      = {
                             "atr_ratio": ind_15m.get("atr_ratio", 1.0) if ind_15m else 1.0,
                             "trend_alignment_score": _ts_fast,
+                            # 极端量能逃生通道
+                            "cvd_delta": _vs_frozen.get("cum_delta", 0.0),
+                            "flow_direction": _vs_frozen.get("direction", ""),
+                            "buy_pct": _vs_frozen.get("buy_pct", 0.5),
                         },
                     )
                     if _fd_score["score"] >= CFG.conviction_full_score:  # 88分 bypass
