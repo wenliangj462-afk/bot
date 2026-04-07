@@ -258,9 +258,17 @@ class VolumeSpikeDetector:
             _accel   = _recent3 - _prior3
             _noise   = baseline * 0.25
             if _accel > _noise:
-                delta_trend = "买压加速"
+                # 区分"买压加速"和"卖压减弱"：加速度正但净delta仍为负时，是卖压减弱而非买压加速
+                if cum_delta_6 < 0:
+                    delta_trend = "卖压减弱"
+                else:
+                    delta_trend = "买压加速"
             elif _accel < -_noise:
-                delta_trend = "卖压加速"
+                # 同理：加速度负但净delta仍为正时，是买压减弱
+                if cum_delta_6 > 0:
+                    delta_trend = "买压减弱"
+                else:
+                    delta_trend = "卖压加速"
             else:
                 delta_trend = "趋势平稳"
         else:
