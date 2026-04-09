@@ -11,13 +11,21 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from common import log, CFG
 from core import UTC
 
-# ── 新闻情绪关键词 ────────────────────────────────────────────────────────
+# ── 新闻情绪关键词（中文 + 英文）─────────────────────────────────────────
 _POSITIVE_KW = ["突破", "创新高", "流入", "买入", "批准", "降息", "牛市", "ETF通过",
                 "增持", "看涨", "升级", "质押", "Layer2扩容", "机构买入", "上海升级",
-                "复苏", "放量", "金叉", "主升浪"]
+                "复苏", "放量", "金叉", "主升浪", "停火", "和平", "缓和"]
 _NEGATIVE_KW = ["暴跌", "崩盘", "流出", "卖出", "监管", "加息", "熊市", "黑客",
                 "禁止", "看空", "漏洞", "51%攻击", "清算", "破产", "脱钩",
-                "死叉", "缩量", "派发", "M顶"]
+                "死叉", "缩量", "派发", "M顶", "制裁", "战争", "冲突", "关税"]
+_POSITIVE_KW_EN = ["breakout", "all-time high", "inflow", "approved", "bullish",
+                   "rally", "upgrade", "institutional", "recovery", "golden cross",
+                   "rate cut", "dovish", "ceasefire", "peace", "stimulus",
+                   "etf approv", "accumulation", "adoption"]
+_NEGATIVE_KW_EN = ["crash", "plunge", "outflow", "hack", "banned", "bearish",
+                   "liquidat", "bankrupt", "exploit", "death cross",
+                   "rate hike", "hawkish", "sanction", "war", "conflict", "tariff",
+                   "default", "recession", "contagion", "sec sue"]
 _NEGATION_PREFIX = ["不", "未", "无", "非", "没有", "不会", "不曾"]
 
 def _has_negation(text: str, kw: str) -> bool:
@@ -29,9 +37,13 @@ def _has_negation(text: str, kw: str) -> bool:
     return any(neg in prefix for neg in _NEGATION_PREFIX)
 
 def _score_title(t: str, source_weight: float = 1.0) -> float:
-    """计算标题得分，乘以来源权重"""
+    """计算标题得分（中英文关键词），乘以来源权重"""
     pos = sum(1 for k in _POSITIVE_KW if k in t and not _has_negation(t, k))
     neg = sum(1 for k in _NEGATIVE_KW if k in t and not _has_negation(t, k))
+    # 英文关键词：大小写不敏感匹配
+    t_lower = t.lower()
+    pos += sum(1 for k in _POSITIVE_KW_EN if k in t_lower)
+    neg += sum(1 for k in _NEGATIVE_KW_EN if k in t_lower)
     return (pos - neg) * source_weight
 
 
@@ -54,32 +66,39 @@ def fetch_fear_greed() -> Dict:
         log.debug("fetch_fear_greed 完成（异常）")
         return {"value": 50, "label": "Neutral"}
 
-def _fetch_cryptopanic() -> list:
+def _fetch_wallstreetcn() -> list:
+    """华尔街见闻快讯：地缘政治、美债、加息降息、宏观经济"""
     titles = []
-    if not CFG.cryptopanic_api_key:
-        return titles
     try:
-        url  = (f"https://cryptopanic.com/api/v1/posts/"
-                f"?auth_token={CFG.cryptopanic_api_key}&currencies=ETH&kind=news&limit=8")
-        data = requests.get(url, timeout=(3, 5)).json()
-        for r in data.get("results", []):
-            votes = r.get("votes", {})
-            bull  = votes.get("positive", 0)
-            bear  = votes.get("negative", 0)
-            tag   = "🟢" if bull > bear else ("🔴" if bear > bull else "⚪")
-            titles.append((f"[CryptoPanic {tag}] {r.get('title', '')}", 1.2))
+        import xml.etree.ElementTree as ET
+        rss = requests.get("https://rsshub.app/wallstreetcn/live/global",
+                           headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        macro_kw = ["美联储", "Fed", "CPI", "通胀", "利率", "加息", "降息", "FOMC",
+                    "非农", "GDP", "美债", "国债", "衰退", "就业", "PMI", "关税",
+                    "制裁", "战争", "冲突", "地缘", "原油", "黄金", "美元",
+                    "ETH", "BTC", "比特币", "以太坊", "加密", "ETF", "SEC",
+                    "流动性", "缩表", "QE", "QT", "鲍威尔", "Powell"]
+        if rss.status_code == 200:
+            root = ET.fromstring(rss.content)
+            for item in root.findall("./channel/item")[:15]:
+                t = (item.find("title").text or "").strip()
+                if any(kw in t for kw in macro_kw):
+                    titles.append((f"[华尔街见闻] {t}", 1.3))
     except Exception as e:
-        log.debug(f"CryptoPanic 失败: {e}")
+        log.debug(f"华尔街见闻 失败: {e}")
     return titles
 
 def _fetch_jinshi_rss() -> list:
+    """金十数据：加密 + 宏观经济快讯"""
     titles = []
     try:
         import xml.etree.ElementTree as ET
         rss    = requests.get("https://rsshub.app/jinshi/information",
                               headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
         eth_kw = ["ETH", "以太坊", "Ethereum", "加密", "美联储", "CPI", "通胀",
-                  "FOMC", "ETF", "利率", "Layer2", "升级", "质押", "Dencun", "EIP", "DeFi"]
+                  "FOMC", "ETF", "利率", "Layer2", "升级", "质押", "Dencun", "EIP", "DeFi",
+                  "美债", "国债", "非农", "GDP", "PMI", "关税", "制裁", "衰退",
+                  "降息", "加息", "鲍威尔", "就业", "SEC", "BTC", "比特币"]
         if rss.status_code == 200:
             root = ET.fromstring(rss.content)
             for item in root.findall("./channel/item")[:10]:
@@ -91,16 +110,21 @@ def _fetch_jinshi_rss() -> list:
     return titles
 
 def _fetch_cointelegraph() -> list:
+    """CoinTelegraph RSS：加密 + 宏观英文新闻"""
     titles = []
     try:
         import xml.etree.ElementTree as ET
         rss = requests.get("https://cointelegraph.com/rss",
                            headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        ct_kw = ["Ethereum", "ETH", "crypto", "Bitcoin", "BTC", "DeFi",
+                 "Fed", "SEC", "ETF", "rate", "CPI", "inflation", "Layer",
+                 "tariff", "sanction", "war", "recession", "stablecoin",
+                 "regulation", "institutional", "whale", "liquidat"]
         if rss.status_code == 200:
             root = ET.fromstring(rss.content)
-            for item in root.findall("./channel/item")[:8]:
+            for item in root.findall("./channel/item")[:10]:
                 t = (item.find("title").text or "").strip()
-                if "Ethereum" in t or "ETH" in t:
+                if any(kw.lower() in t.lower() for kw in ct_kw):
                     titles.append((f"[CoinTelegraph] {t}", 1.2))
     except Exception as e:
         log.debug(f"CoinTelegraph 失败: {e}")
@@ -110,7 +134,7 @@ def fetch_global_news(top_n: int = 5) -> Dict:
     log.debug("fetch_global_news 开始（15秒超时保护）...")
     all_titles = []
     with ThreadPoolExecutor(max_workers=3, thread_name_prefix="news-fetch") as executor:
-        futures = [executor.submit(_fetch_cryptopanic),
+        futures = [executor.submit(_fetch_wallstreetcn),
                    executor.submit(_fetch_jinshi_rss),
                    executor.submit(_fetch_cointelegraph)]
         done, _ = wait(futures, timeout=15)
@@ -143,6 +167,10 @@ def fetch_global_news(top_n: int = 5) -> Dict:
         top_weight += w
         for kw in _POSITIVE_KW + _NEGATIVE_KW:
             if kw in t:
+                keywords[kw] = keywords.get(kw, 0) + 1
+        t_lower = t.lower()
+        for kw in _POSITIVE_KW_EN + _NEGATIVE_KW_EN:
+            if kw in t_lower:
                 keywords[kw] = keywords.get(kw, 0) + 1
 
     sentiment = total_score / top_weight if top_weight > 0 else 0
