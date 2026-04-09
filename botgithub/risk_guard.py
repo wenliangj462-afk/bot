@@ -195,6 +195,13 @@ class RiskGuard:
                             has_sym_pos = len(exch_pos_list) > 0
                             if not has_sym_pos:
                                 # 幽灵仓位：本地认为有持仓，但交易所没有
+                                # P0 Fix: 先撤销交易所残留算法单，防止影响后续新仓位
+                                try:
+                                    n_cancelled = self.okx.cancel_all_algo_orders(CFG.symbol)
+                                    if n_cancelled > 0:
+                                        log.warning(f"🗑️ 幽灵仓位清理：已撤销 {n_cancelled} 个残留算法单")
+                                except Exception as _algo_e:
+                                    log.warning(f"⚠️ 幽灵仓位清理：撤销算法单失败: {_algo_e}")
                                 log.error(f"👻 [{CFG.symbol}] 幽灵仓位检测：本地持仓{side}但交易所无持仓，尝试平仓清除")
                                 _webhook("👻 幽灵仓位", f"[{CFG.symbol}] 本地持仓{side}但交易所无持仓，尝试平仓")
                                 self.trader.position_exec._close("幽灵仓位清除", symbol=CFG.symbol)
@@ -303,6 +310,58 @@ class RiskGuard:
                 else:
                     # 趋势：ATR×2.5，下限1.5%防过于敏感，上限3.5%防过于迟钝
                     act_pct = max(0.015, min(0.035, _tr_atr_r * 2.5)) if _tr_atr_r > 0 else CFG.trailing_act_pct
+                # ── VSpike 趋势捕捉模式 ──────────────────────────────────
+                # 极端量能（≥10x）与持仓方向一致时：降低trailing激活阈值+拉宽TP
+                _TREND_CAPTURE_MULT = 10.0
+                _TREND_CAPTURE_TTL  = 1800.0  # 30分钟有效
+                _now_mono = time.monotonic()
+                _capture_active = (
+                    pos.trend_capture_ts > 0 and
+                    (_now_mono - pos.trend_capture_ts) < _TREND_CAPTURE_TTL
+                )
+                _vs_st = self.trader.vspike.get_status()
+                _vs_mult = _vs_st.get("mult", 0)
+                _vs_dir = _vs_st.get("direction", "均衡")
+                _spike_on = _vs_st.get("is_spike") or _vs_st.get("spike_recent")
+                _vs_aligned = (
+                    (side == "long" and "买方主导" in _vs_dir) or
+                    (side == "short" and "卖方主导" in _vs_dir)
+                )
+                # 激活/升级：首次 or 更大的同向 VSpike 刷新TTL
+                if _spike_on and _vs_mult >= _TREND_CAPTURE_MULT and _vs_aligned:
+                    _first_time = not _capture_active
+                    if _first_time or _vs_mult > pos.trend_capture_mult:
+                        with lock:
+                            pos.trend_capture_ts = _now_mono
+                            pos.trend_capture_mult = _vs_mult
+                        _capture_active = True
+                        log.info(
+                            f"🚀 [{CFG.symbol}] VSpike趋势捕捉"
+                            f"{'激活' if _first_time else '升级'}: "
+                            f"{_vs_mult:.1f}x {_vs_dir} → "
+                            f"trailing降至0.3%, TP拉宽至3×ATR"
+                        )
+                        # TP 拉宽（仅首次激活时执行一次，避免反复调API）
+                        if _first_time and atr_trailing > 0 and entry > 0 and tp > 0:
+                            _wide_tp = (
+                                entry + 3 * atr_trailing if side == "long"
+                                else entry - 3 * atr_trailing
+                            )
+                            _should_widen = (
+                                (_wide_tp > tp) if side == "long"
+                                else (_wide_tp < tp)
+                            )
+                            if _should_widen:
+                                self.trader.position_exec._adjust_sl_tp(
+                                    sl, _wide_tp,
+                                    f"VSpike趋势捕捉TP拉宽"
+                                    f"({_vs_mult:.0f}x, 3×ATR)",
+                                    symbol=CFG.symbol,
+                                )
+                # 趋势捕捉生效中：trailing 激活阈值降至 0.3%
+                if _capture_active:
+                    act_pct = min(act_pct, 0.003)
+
                 # 检查 AI 平仓协调标志，防止与 AI 平仓重复下单
                 if hasattr(self.trader, "_ai_close_pending_until") and time.monotonic() < self.trader._ai_close_pending_until:
                     log.debug(f"[{CFG.symbol}] AI 平仓协调中，跳过追踪止损 (剩余{self.trader._ai_close_pending_until - time.monotonic():.1f}s)")
@@ -454,49 +513,80 @@ class RiskGuard:
                     # 1.5R触发：盈利达到止损距离的1.5倍
                     if pnl_pct >= sl_dist_pct * 1.5:
                         close_sz = max(1, int(size * 0.25))   # 平25%
-                        log.debug(f"🎯 [{CFG.symbol}] 盈利达1.5R({pnl_pct*100:.2f}%)，分批止盈 {close_sz}张(25%)")
-                        try:
-                            close_side = "sell" if side == "long" else "buy"
-                            # 注：风控线程直接发起市价平仓，不经过 position_exec（紧急平仓逻辑）
-                            close_res  = self.okx._request(
-                                "POST", "/api/v5/trade/order",
-                                body_data={"instId": CFG.symbol, "tdMode": "isolated",
-                                           "side": close_side, "posSide": side,
-                                           "ordType": "market", "sz": str(close_sz),
-                                           "reduceOnly": "true"}
-                            )
-                            if close_res.get("code") == "0":
-                                sz_remain_1r = max(1, int(size - close_sz))
-                                # 锁内只做内存状态计算和状态持久化
-                                with lock:
-                                    partial_tp_triggered = True
-                                    pos.partial_tp_triggered = True
-                                    breakeven_triggered = True
-                                    pos.breakeven_triggered = True
-                                    pos.size = sz_remain_1r
-                                    if side == "long":
-                                        new_sl = entry - _sl_move_r * abs(entry - sl)
-                                    else:
-                                        new_sl = entry + _sl_move_r * abs(entry - sl)
-                                    pos.stop_loss = new_sl
-                                save_state_to_disk(pos)
-                                # 锁外才发起网络API调用，遵守"持锁期间禁止网络IO"规则
-                                _sz_for_algo = str(sz_remain_1r)
-                                _sl_for_algo = new_sl
-                                sz_remain = _sz_for_algo
-                                new_sl = _sl_for_algo
-                                algo_ok = self.okx.update_algo_orders(side, sz_remain, new_sl, tp, symbol=CFG.symbol)
-                                self.trader._last_adjust_time = datetime.now(UTC)
-                                if algo_ok:
-                                    log.warning(f"🛡️ [{CFG.symbol}] 1.5R分批平{close_sz}张，SL移至{new_sl:.4f}(0.3R成本以下)")
+                        # ── P0 Fix: 仓位≤close_sz时无法分批，只收紧SL ──────────
+                        # 修复: size=1时 close_sz=1 会全平→幽灵仓位→残留算法单杀新仓
+                        if close_sz >= int(size):
+                            log.info(f"🛡️ [{CFG.symbol}] 盈利达1.5R({pnl_pct*100:.2f}%)，"
+                                     f"仓位仅{int(size)}张无法分批，仅收紧SL到成本附近")
+                            with lock:
+                                if side == "long":
+                                    new_sl = entry - _sl_move_r * abs(entry - sl)
                                 else:
-                                    log.error(f"❌ [{CFG.symbol}] 1.5R分批后更新算法单失败！")
-                                    _webhook("❌ 算法单更新失败", f"[{CFG.symbol}] 1.5R分批后SL挂单失败，SL={new_sl:.4f}，请手动设置")
-                                _webhook("🎯 1.5R分批止盈", f"[{CFG.symbol}] 平{close_sz}张(25%)，剩余SL=0.5R({new_sl:.4f})")
+                                    new_sl = entry + _sl_move_r * abs(entry - sl)
+                                pos.stop_loss = new_sl
+                                partial_tp_triggered = True
+                                pos.partial_tp_triggered = True
+                                breakeven_triggered = True
+                                pos.breakeven_triggered = True
+                            save_state_to_disk(pos)
+                            _sz_str = str(int(size))
+                            algo_ok = self.okx.update_algo_orders(
+                                side, _sz_str, new_sl, tp, symbol=CFG.symbol)
+                            self.trader._last_adjust_time = datetime.now(UTC)
+                            if algo_ok:
+                                log.warning(f"🛡️ [{CFG.symbol}] 1.5R保护(仅{int(size)}张)，"
+                                            f"SL移至{new_sl:.4f}(0.3R成本以下)")
                             else:
-                                log.error(f"❌ [{CFG.symbol}] 1.5R分批止盈失败: {close_res.get('msg', '')}")
-                        except Exception as e:
-                            log.error(f"[{CFG.symbol}] 1.5R分批止盈异常: {e}")
+                                log.error(f"❌ [{CFG.symbol}] 1.5R SL收紧失败！")
+                                _webhook("❌ 算法单更新失败",
+                                         f"[{CFG.symbol}] 1.5R SL收紧失败，SL={new_sl:.4f}")
+                            _webhook("🛡️ 1.5R SL保护",
+                                     f"[{CFG.symbol}] 仅{int(size)}张无法分批，SL→{new_sl:.4f}")
+                        else:
+                            # ── 正常分批止盈（size≥2） ─────────────────────────
+                            log.debug(f"🎯 [{CFG.symbol}] 盈利达1.5R({pnl_pct*100:.2f}%)，分批止盈 {close_sz}张(25%)")
+                            try:
+                                close_side = "sell" if side == "long" else "buy"
+                                # 注：风控线程直接发起市价平仓，不经过 position_exec（紧急平仓逻辑）
+                                close_res  = self.okx._request(
+                                    "POST", "/api/v5/trade/order",
+                                    body_data={"instId": CFG.symbol, "tdMode": "isolated",
+                                               "side": close_side, "posSide": side,
+                                               "ordType": "market", "sz": str(close_sz),
+                                               "reduceOnly": "true"}
+                                )
+                                if close_res.get("code") == "0":
+                                    sz_remain_1r = max(1, int(size - close_sz))
+                                    # 锁内只做内存状态计算和状态持久化
+                                    with lock:
+                                        partial_tp_triggered = True
+                                        pos.partial_tp_triggered = True
+                                        breakeven_triggered = True
+                                        pos.breakeven_triggered = True
+                                        pos.size = sz_remain_1r
+                                        if side == "long":
+                                            new_sl = entry - _sl_move_r * abs(entry - sl)
+                                        else:
+                                            new_sl = entry + _sl_move_r * abs(entry - sl)
+                                        pos.stop_loss = new_sl
+                                    save_state_to_disk(pos)
+                                    # 锁外才发起网络API调用，遵守"持锁期间禁止网络IO"规则
+                                    _sz_for_algo = str(sz_remain_1r)
+                                    _sl_for_algo = new_sl
+                                    sz_remain = _sz_for_algo
+                                    new_sl = _sl_for_algo
+                                    algo_ok = self.okx.update_algo_orders(side, sz_remain, new_sl, tp, symbol=CFG.symbol)
+                                    self.trader._last_adjust_time = datetime.now(UTC)
+                                    if algo_ok:
+                                        log.warning(f"🛡️ [{CFG.symbol}] 1.5R分批平{close_sz}张，SL移至{new_sl:.4f}(0.3R成本以下)")
+                                    else:
+                                        log.error(f"❌ [{CFG.symbol}] 1.5R分批后更新算法单失败！")
+                                        _webhook("❌ 算法单更新失败", f"[{CFG.symbol}] 1.5R分批后SL挂单失败，SL={new_sl:.4f}，请手动设置")
+                                    _webhook("🎯 1.5R分批止盈", f"[{CFG.symbol}] 平{close_sz}张(25%)，剩余SL=0.5R({new_sl:.4f})")
+                                else:
+                                    log.error(f"❌ [{CFG.symbol}] 1.5R分批止盈失败: {close_res.get('msg', '')}")
+                            except Exception as e:
+                                log.error(f"[{CFG.symbol}] 1.5R分批止盈异常: {e}")
 
                 # ── 2.5R 再平25%：多级分批止盈 ─────────────────────────────────
                 if (size >= 1 and not partial_tp_2_5R_triggered
@@ -537,6 +627,11 @@ class RiskGuard:
                                 else:
                                     # 最后一张合约已平，直接重置本地状态（无需等 WS pos=0）
                                     log.info(f"✅ [{CFG.symbol}] 2.5R分批止盈后仓位归零，直接重置状态")
+                                    # P0 Fix: 全平后撤销交易所残留算法单
+                                    try:
+                                        self.okx.cancel_all_algo_orders(CFG.symbol)
+                                    except Exception:
+                                        pass
                                     self.trader.state._reset_pos()
                                     _webhook("🎯 2.5R分批止盈（全平）", f"[{CFG.symbol}] 再平{close_sz}张，仓位清零")
                             else:
@@ -630,7 +725,7 @@ class RiskGuard:
                         reason="time_stop"
                     ))
                     is_update = True
-                    log.info(f"⏰ [{sym}] 时间止损触发：持仓{holding_minutes/60:.0f}分钟 盈利{pnl_pct*100:.2f}% 移动SL至{new_sl:.4f}")
+                    log.info(f"⏰ [{sym}] 时间止损触发：持仓{holding_minutes:.0f}分钟 盈利{pnl_pct*100:.2f}% 移动SL至{new_sl:.4f}")
         # ────────────────────────────────────────────────────────────────────────
 
         if pos.side == "long":
