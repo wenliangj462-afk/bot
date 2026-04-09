@@ -118,6 +118,9 @@ class Position:
     ai_reason:          Optional[str]  = None
     ai_conf_at_open:    float          = 0.0
     sl_tp_algo_ids:     list           = field(default_factory=list)
+    # VSpike 趋势捕捉模式（极端量能与持仓方向一致时激活，降低trailing阈值+拉宽TP）
+    trend_capture_ts:   float          = 0.0   # 激活时间(monotonic)，0=未激活
+    trend_capture_mult: float          = 0.0   # 触发的VSpike倍率
     exit_rsi:          float          = 0.0
     exit_bb_pct:       float          = 0.0
     exit_atr_pct:      float          = 0.0
