@@ -186,6 +186,9 @@ class VolumeSpikeDetector:
         self._cum_buy:  float = 0.0
         self._cum_sell: float = 0.0
         self.market_mode: str = "趋势"
+        # P0-1: spike 方向历史，用于检测短时间内方向反转（防震荡市双向来回砍）
+        self._spike_history: deque = deque(maxlen=20)
+        self._reversal_notified_key: str = ""  # 已消费的最新反转标识，避免重复返回
         self._status: Dict = {
             "is_spike": False, "mult": 1.0,
             "buy_pct": 0.5, "direction": "均衡",
@@ -311,6 +314,8 @@ class VolumeSpikeDetector:
 
         if _just_triggered:
             self._last_spike_ts = now
+            # P0-1: 记录 spike 方向历史（时间戳, 方向, 倍数, buy_pct）
+            self._spike_history.append((now, direction, round(mult, 2), round(buy_pct, 3)))
             log.info(
                 f"[VSpike+EAT-FLOW] {self.market_mode} "
                 f"突增 {mult:.1f}x(阈值{thresh:.1f}x) "
@@ -336,6 +341,46 @@ class VolumeSpikeDetector:
                 # 峰值过期，清除旧数据，避免返回 stale 数据
                 self._spike_peak_data = {}
         return status
+
+    def has_recent_reversal(self, lookback_secs: float = 600.0, min_mult: float = 3.0) -> Dict:
+        """
+        P0-1: 检测近 lookback_secs 内是否有 VSpike 方向反转。
+        返回 {"reversed": bool, "detail": str}
+        每次调用会记录已通知的反转状态，相同方向+量级的反转不会重复返回。
+        震荡市内 VSpike 方向翻转是流动性扫单噪声，不应追着翻仓。
+        """
+        now = time.time()
+        with self._lock:
+            recent = [(ts, d, m, bp) for ts, d, m, bp in self._spike_history
+                      if now - ts < lookback_secs and m >= min_mult and d != "均衡"]
+        if len(recent) < 2:
+            return {"reversed": False, "detail": ""}
+        # 检查是否有买方→卖方 或 卖方→买方 的反转
+        # 量级过滤：小 VSpike 不构成对大 VSpike 的有效反转
+        dirs = [(ts, d, m) for ts, d, m, _ in recent]
+        for i in range(len(dirs) - 1):
+            ts_a, dir_a, mult_a = dirs[i]
+            ts_b, dir_b, mult_b = dirs[i + 1]
+            if dir_a != dir_b:
+                # 后者量级 < 前者的 1/3 → 量级悬殊，不视为有效反转
+                if mult_b < mult_a / 3.0:
+                    continue
+                # 已消费检查：相同方向组合 + 量级差距在 10% 内视为同一事件
+                gap = ts_b - ts_a
+                _new_key = f"{dir_a}:{dir_b}:{mult_a:.0f}:{mult_b:.0f}"
+                if _new_key == self._reversal_notified_key:
+                    return {"reversed": False, "detail": ""}
+                # 记录本次已通知的反转标识
+                self._reversal_notified_key = _new_key
+                return {
+                    "reversed": True,
+                    "detail": (f"{dir_a}({mult_a:.1f}x) → {dir_b}({mult_b:.1f}x), "
+                              f"间隔{gap:.0f}s"),
+                    "gap_secs": gap,
+                    "first_dir": dir_a,
+                    "second_dir": dir_b,
+                }
+        return {"reversed": False, "detail": ""}
 
     def reset_event(self) -> None:
         self.spike_event.clear()
@@ -940,6 +985,29 @@ class OkxTrader:
         sym = CFG.symbol
         return self._request("POST", "/api/v5/trade/cancel-algos",
                              body_data=[{"algoId": algo_id, "instId": sym}])
+
+    def cancel_all_algo_orders(self, symbol: str = None) -> int:
+        """撤销指定品种的所有活跃算法单，返回成功撤销数量。
+        用于幽灵仓位清理、全平后防止残留算法单影响后续新仓位。
+        """
+        sym = symbol or CFG.symbol
+        resp = self.get_algo_orders()
+        if resp.get("code") != "0":
+            log.warning(f"撤销残留算法单：查询失败 {resp}")
+            return 0
+        algo_list = [a for a in resp.get("data", []) if a.get("instId") == sym]
+        if not algo_list:
+            return 0
+        cancelled = 0
+        for algo in algo_list:
+            algo_id = algo.get("algoId")
+            cancel_res = self.cancel_algo_order(algo_id)
+            if cancel_res.get("code") == "0":
+                log.info(f"🗑️ 已撤销残留算法单 {algo_id}")
+                cancelled += 1
+            else:
+                log.warning(f"⚠️ 撤销算法单 {algo_id} 失败: {cancel_res}")
+        return cancelled
 
     def place_algo_order(self, side: str, posSide: str, sz: str,
                          sl_px: float, tp_px: float) -> Dict:
