@@ -57,8 +57,8 @@ _CFG_FIELD_MAP: Dict[str, tuple] = {
     "CONSECUTIVE_LOSS_REDUCE_FACTOR": ("consecutive_loss_reduce_factor", float),
     "CLOSE_CONFIDENCE_THRESHOLD": ("close_confidence_threshold", float),
     "REASONER_CONSEC_LOSS_THRESH":   ("reasoner_consec_loss_thresh",   int,   2,     6),
-    "REASONER_ROE_THRESH":            ("reasoner_roe_thresh",          float, -0.25, -0.05),
-    "REASONER_ATR_RATIO_THRESH":     ("reasoner_atr_ratio_thresh",    float, 1.2,   2.5),
+    "REASONER_ROE_THRESH":            ("reasoner_roe_thresh",          float, -3.0, -0.05),
+    "REASONER_ATR_RATIO_THRESH":     ("reasoner_atr_ratio_thresh",    float, 1.2,   3.0),
     "TIME_STOP_MINUTES":         ("time_stop_minutes",         int),
     "OSC_AGGRESSIVE_ADX_THRESH": ("osc_aggressive_adx_thresh", float),
     "SL_MIN_ATR_MULT":           ("sl_min_atr_mult",           float),
@@ -182,6 +182,8 @@ class BotConfig:
     max_consecutive_loss:  int   = int(os.getenv("MAX_CONSECUTIVE_LOSS", "3"))
     min_cooldown_after_loss: int = int(os.getenv("MIN_COOLDOWN_AFTER_LOSS", "20"))
     consecutive_loss_reduce_factor: float = float(os.getenv("CONSECUTIVE_LOSS_REDUCE_FACTOR", "0.7"))
+    reasoner_min_pnl_pct:     float = float(os.getenv("REASONER_MIN_PNL_PCT", "-2.0"))
+    reasoner_min_interval_sec: int = int(os.getenv("REASONER_MIN_INTERVAL_SEC", "300"))
     maintenance_margin_rate: float = float(os.getenv("MAINTENANCE_MARGIN_RATE", "0.004"))
     health_port:           int   = int(os.getenv("HEALTH_PORT", "8080"))
     webhook_url:           str   = os.getenv("WEBHOOK_URL", "")
@@ -233,8 +235,8 @@ class BotConfig:
     open_wait_price_drift_pct:   float = float(os.getenv("OPEN_WAIT_PRICE_DRIFT_PCT", "0.001"))
     # ── Reasoner 触发阈值（可配置化，无需改代码）─────────────────────────────
     reasoner_consec_loss_thresh: int   = int(os.getenv("REASONER_CONSEC_LOSS_THRESH",   "3"))
-    reasoner_roe_thresh:         float = float(os.getenv("REASONER_ROE_THRESH",          "-0.15"))
-    reasoner_atr_ratio_thresh:   float = float(os.getenv("REASONER_ATR_RATIO_THRESH",  "1.8"))
+    reasoner_roe_thresh:         float = float(os.getenv("REASONER_ROE_THRESH",          "-2.0"))
+    reasoner_atr_ratio_thresh:   float = float(os.getenv("REASONER_ATR_RATIO_THRESH",  "2.5"))
     # ── SL ATR 自适应参数（各市场模式 floor/cap）─────────────────────────────
     sl_atr_floor_osc_aggr: float = float(os.getenv("SL_ATR_FLOOR_OSC_AGGR", "0.8"))
     sl_atr_cap_osc_aggr:    float = float(os.getenv("SL_ATR_CAP_OSC_AGGR",    "2.2"))
@@ -300,6 +302,7 @@ class BotConfig:
     stale_lev_reduction:        float = float(os.getenv("STALE_DATA_LEV_REDUCTION",   "0.8"))
     ai_failure_exp_backoff:     float = float(os.getenv("AI_FAILURE_EXP_BACKOFF",     "1.5"))
     vspike_priority_threshold:  float = float(os.getenv("VSPIKE_PRIORITY_THRESHOLD",  "15.0"))
+    aggressive_conflict_cooldown: float = float(os.getenv("AGGRESSIVE_CONFLICT_COOLDOWN", "180.0"))
     ai_fastlane_min_interval:   int   = int(os.getenv("AI_FASTLANE_MIN_INTERVAL",     "5"))
     ob_fastlane_imbalance:      float = float(os.getenv("OB_FASTLANE_IMBALANCE",      "0.35"))
     qwen_api_key:             str   = os.getenv("QWEN_API_KEY",              "").strip()
