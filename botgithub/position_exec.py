@@ -23,7 +23,17 @@ from core import (
 # ── config ──────────────────────────────────────────────────────────────
 from config import log_slippage
 
-# ── 辅助函数（待实现或从其他模块迁移）────────────────────────────────────
+# ── 辅助函数 ─────────────────────────────────────────────────────────────
+
+def _get_sl_cap(market_mode: str) -> float:
+    """获取 SL ATR 倍数上限（与 .env 中 SL_ATR_CAP_xxx 保持一致）"""
+    if market_mode == "震荡激进":
+        return CFG.sl_atr_cap_osc_aggr
+    elif market_mode == "震荡":
+        return CFG.sl_atr_cap_osc
+    else:
+        return CFG.sl_atr_cap_trend
+
 def _get_atr_quantile(current_atr: float, atr_history: List[float]) -> float:
     """计算当前 ATR 在历史 ATR 序列中的分位数"""
     if not atr_history or current_atr <= 0:
@@ -66,6 +76,9 @@ class PositionExec:
         self._cv_rejected = False
         self._cv_rejected_score = 0.0
         self._cv_rejected_action = ""
+        # 算法单去重：记录上次成功提交的 SL/TP，避免相同值反复撤单重挂
+        self._last_submitted_sl = 0.0
+        self._last_submitted_tp = 0.0
 
     def _do_light_adjust(self, sym: str):
         """
@@ -155,6 +168,20 @@ class PositionExec:
             if adjust == "no":
                 return
 
+            # VSpike 趋势捕捉模式：TP 不得回收到 entry ± 3×ATR 以内
+            _CAPTURE_TTL = 1800.0
+            if (pos.trend_capture_ts > 0 and
+                    (time.monotonic() - pos.trend_capture_ts) < _CAPTURE_TTL and
+                    atr > 0 and entry > 0):
+                _floor_tp = (entry + 3 * atr) if pos.side == "long" else (entry - 3 * atr)
+                if (pos.side == "long" and new_tp < _floor_tp) or \
+                   (pos.side == "short" and new_tp > _floor_tp):
+                    log.info(
+                        f"🚀 [{sym}] 趋势捕捉TP保护: AI建议TP={new_tp:.2f}"
+                        f" < floor={_floor_tp:.2f}(3×ATR), 强制拉宽"
+                    )
+                    new_tp = _floor_tp
+
             log.info(f"🤖 [{sym}] light_adjust: {adjust} | sl={new_sl:.4f} tp={new_tp:.4f} "
                      f"partial={partial_pct}% be={set_be} trail_atr={trail_atr:.1f} | {reason}")
 
@@ -227,6 +254,22 @@ class PositionExec:
                     if new_sl < max_allowed_sl:
                         log.info(f"⚠️ [{sym}] AI SL {new_sl:.4f} 过近（最小允许 {max_allowed_sl:.4f}），截断")
                         new_sl = max_allowed_sl
+
+                # SL 上限裁剪：防止 AI 给出过远的止损（> cap×ATR）
+                if atr > 0:
+                    _sl_cap = _get_sl_cap(market_mode)
+                    max_sl_dist = _sl_cap * atr
+                    actual_dist = abs(price - new_sl)
+                    if actual_dist > max_sl_dist:
+                        lev = pos.leverage if pos.leverage > 0 else 10
+                        hard_max_dist = price * CFG.hard_stop_loss_pct / lev
+                        final_cap = min(max_sl_dist, hard_max_dist)
+                        new_sl_dist = min(actual_dist, final_cap)
+                        new_sl = price - new_sl_dist if pos.side == "long" else price + new_sl_dist
+                        log.warning(
+                            f"🛡️ [{sym}] light_adjust SL过远：{actual_dist:.2f}（{actual_dist/atr:.1f}×ATR）"
+                            f" 超过cap={_sl_cap:.1f}×ATR={max_sl_dist:.2f}，裁剪至{new_sl_dist:.2f}"
+                        )
 
             _final_sl = new_sl if adjust in ("sl_only", "both") else current_sl
             _final_tp = new_tp if adjust in ("tp_only", "both") else current_tp
@@ -432,12 +475,34 @@ class PositionExec:
                 with self.trader._margin_lock:
                     self.trader._reserved_margin = max(0.0, self.trader._reserved_margin - margin_to_release)
                 log.info(f"🔓 [{sym}] 成交释放预留保证金: {margin_to_release:.2f}U")
-            # 状态清理（锁内）
+            # P2: 立即从订单数据更新内存状态（避免 sync_position 网络延迟期间的幽灵状态）
+            # 从订单回调中提取 side / size / avg_price，锁内写入
+            _fill_side = data.get("side", "")     # "buy" / "sell"
+            _fill_px   = float(data.get("avgPx", 0) or data.get("px", 0))
+            _fill_sz   = acc_fill
+            _pos_side  = ""
+            if pending:
+                _pos_side = pending.get("side", "")  # "long" / "short"
+            elif _fill_side == "buy":
+                _pos_side = "long"
+            elif _fill_side == "sell":
+                _pos_side = "short"
             with lock:
                 pos.pending_ord_id = ""
                 pos.partial_filled = 0.0
+                # 仅在本地无持仓时写入，避免覆盖已有持仓（加仓场景由 sync 处理）
+                if not pos.side and _pos_side and _fill_sz > 0:
+                    pos.side = _pos_side
+                    pos.size = _fill_sz
+                    if _fill_px > 0:
+                        pos.entry_price = _fill_px
+                    pos.open_time = datetime.now(UTC)
+                    log.info(
+                        f"🔄 [{sym}] pending→filled 立即写入内存: "
+                        f"side={_pos_side} sz={_fill_sz} px={_fill_px:.2f}"
+                    )
                 save_state_to_disk(pos)
-            # 同步仓位（锁外，无锁保护，但持仓已清pending_ord_id，不会重复进入）
+            # 同步仓位（锁外，以交易所真实状态为准修正内存）
             self.trader.state.sync_position(symbol=sym)
             self.trader.state._full_state_sync()
             log.info(f"🔄 [{sym}] pending订单处理完成")
@@ -473,6 +538,13 @@ class PositionExec:
         with lock:
             if not pos.side:
                 return
+            # 算法单去重：SL/TP 未实质变化时跳过，避免反复撤单重挂浪费 API 配额。
+            # ⚠️ 此检查必须在 cooldown 之前——未执行的调用不应消耗冷却配额，
+            #   否则一次冗余调用后真实调改会被冷却期拦截。
+            if (abs(new_sl - self._last_submitted_sl) < 0.01 and
+                    abs(new_tp - self._last_submitted_tp) < 0.01 and
+                    self._last_submitted_sl > 0):
+                return
             last_dt = self.trader._last_adjust_time
             if last_dt and (datetime.now(UTC) - last_dt).total_seconds() < cool_down_seconds:
                 return
@@ -503,6 +575,9 @@ class PositionExec:
                 save_state_to_disk(pos)
             log.info(f"🛡️ [{sym}] SL={new_sl:.4f} TP={new_tp:.4f} | {reason}")
             _webhook("调整止盈止损", f"[{sym}] SL={new_sl:.4f} TP={new_tp:.4f}\n{reason}")
+            # 记录已提交的 SL/TP，防止后续重复撤单重挂
+            self._last_submitted_sl = new_sl
+            self._last_submitted_tp = new_tp
             # 12.11：止损价已变化，清除AI缓存强制下轮重新决策
             # 否则AI会基于旧止损价持续输出相同的 adjust_sl_tp
             self.trader._clear_ai_cache(symbol=sym)
@@ -568,6 +643,19 @@ class PositionExec:
             if actual_dist < atr:
                 log.info(f"⚠️ AI建议SL距离={actual_dist:.2f} < 1×ATR={atr:.2f}，扩宽至{sl_dist_min:.2f}")
                 sl = price - sl_dist_min if is_long else price + sl_dist_min
+
+            # SL 上限裁剪：AI 返回的 SL 距离不得超过市场模式的 ATR cap
+            sl_cap_dist = _cap * atr
+            if actual_dist > sl_cap_dist:
+                # 额外硬性上限：HARD_STOP_LOSS_PCT / leverage 防止极端亏损
+                hard_max_dist = price * CFG.hard_stop_loss_pct / lev
+                final_cap = min(sl_cap_dist, hard_max_dist)
+                new_sl_dist = min(actual_dist, final_cap)
+                sl = price - new_sl_dist if is_long else price + new_sl_dist
+                log.warning(
+                    f"🛡️ [{sym}] AI止损过远：距离={actual_dist:.2f}（{actual_dist/atr:.1f}×ATR）"
+                    f" 超过cap={_cap:.1f}×ATR={sl_cap_dist:.2f}，裁剪至{new_sl_dist:.2f}（SL={sl:.2f}）"
+                )
 
         dist = abs(price - sl)
 
@@ -1032,8 +1120,12 @@ class PositionExec:
         )
 
         with lock:
-            pos.pending_ord_id  = ord_id
-            pos.last_open_time  = datetime.now(UTC)
+            pos.side                 = posSide
+            pos.size                 = float(size)
+            pos.entry_price          = price
+            pos.open_time            = datetime.now(UTC)
+            pos.pending_ord_id       = ord_id
+            pos.last_open_time       = datetime.now(UTC)
             pos.partial_filled       = 0.0
             pos.liq_price            = liq_price_est
             pos.leverage             = lev
@@ -1092,6 +1184,8 @@ class PositionExec:
         # Phase 3: 状态机推进 → HOLDING
         if hasattr(self.trader, '_state_machine'):
             self.trader._state_machine.transition(TradingState.HOLDING, "开仓确认完成")
+        # 记录开仓时间戳，供 WS pos=0 延迟消息保护窗口使用
+        self.trader._last_open_ts = time.monotonic()
         # Phase 4: EventBus 开仓通知（原代码无此通知，新增）
         if hasattr(self.trader, '_event_bus'):
             self.trader._event_bus.publish("trade_open", {
@@ -1468,6 +1562,12 @@ class PositionExec:
             with lock:
                 if pos.side == side_snapshot:
                     self.trader.state._reset_pos()
+            # 平仓后清除已提交的 SL/TP 记录，避免影响下一笔交易
+            self._last_submitted_sl = 0.0
+            self._last_submitted_tp = 0.0
+            # 记录平仓退出时间与方向，供开仓冷却期使用
+            gs_set("last_exit_ts", datetime.now(UTC).isoformat())
+            gs_set("last_exit_side", side_snapshot)
             # Phase 3: 状态机推进 → IDLE
             if hasattr(self.trader, '_state_machine') and self.trader._state_machine.is_exiting():
                 self.trader._state_machine.transition(TradingState.IDLE, "平仓确认完成")
@@ -1566,10 +1666,19 @@ class PositionExec:
                             self.trader._clear_ai_cache(symbol=sym)
                             log.warning(f"⚠️ 放弃补写平仓记录：无法获取有效出场价（trade_id={current_trade_id}）")
 
+                        # P0 Fix: 撤销交易所残留算法单（防止旧SL/TP杀死后续新仓位）
+                        try:
+                            n_cancelled = self.okx.cancel_all_algo_orders(sym)
+                            if n_cancelled > 0:
+                                log.warning(f"🗑️ 幽灵仓位清理：已撤销 {n_cancelled} 个残留算法单")
+                        except Exception as _purge_e:
+                            log.warning(f"⚠️ 幽灵仓位清理：撤销残留算法单失败: {_purge_e}")
                         # 清除本地状态
                         with self.trader.lock:
                             if pos.side == side_snapshot:
                                 self.trader.state._reset_pos()
+                        self._last_submitted_sl = 0.0
+                        self._last_submitted_tp = 0.0
                         self.trader._clear_ai_cache(symbol=sym)
                         log.info("✅ 幽灵仓位已清除，DB 记录已补写，恢复正常运行")
                         _webhook(
