@@ -1800,9 +1800,14 @@ class DailyReportModule:
 
             win_rate = (win_count / trade_count * 100) if trade_count > 0 else 0
             net_profit = total_pnl - total_fee
-            # 修复除零：当毛盈亏接近0时，用极小值替代
-            abs_pnl = abs(total_pnl) if abs(total_pnl) > 1e-6 else 1e-9
-            fee_ratio = total_fee / abs_pnl
+            # P1-2: 资金损耗率公式修正
+            # 旧公式 fee/abs(pnl) 在毛盈亏接近0时爆炸（如341%），失去参考意义
+            # 新公式：fee / (fee + abs(net_profit))，表示"费用占总交易成果的比例"
+            # - 手续费2U, 净亏-1U → 2/(2+1)=67% —— 手续费是主因
+            # - 手续费2U, 净赚5U → 2/(2+5)=29% —— 可接受
+            # - 手续费0.1U, 净赚5U → 0.1/5.1=2% —— 优秀
+            _fee_denom = total_fee + abs(net_profit)
+            fee_ratio = total_fee / _fee_denom if _fee_denom > 1e-6 else 0.0
 
             trades = get_trades_in_range(yesterday, now)
             high_conf_trades = [t for t in trades if t.get('confidence', 0) >= 0.8]
