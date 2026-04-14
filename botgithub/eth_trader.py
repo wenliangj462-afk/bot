@@ -48,7 +48,6 @@ from collections import deque
 
 import pandas as pd
 import numpy as np
-# import pandas_ta as ta  # 未使用，手动计算所有指标
 import socket
 import websocket
 from dotenv import load_dotenv
@@ -69,7 +68,7 @@ from core import (
 # ── 共享基础设施（common.py）────────────────────────────────────────────
 from common import (
     log, ai_log, log_event, kelly_optimal_size, bayesian_posterior,
-    log_kelly_metrics, init_db, get_db_conn, get_sys_config, set_sys_config,
+    log_kelly_metrics, init_db, get_db_conn, get_db_manager, get_sys_config, set_sys_config,
     submit_pending_config, get_pending_configs, approve_pending_config,
     reject_pending_config, try_apply_level2_suggestions, _load_dynamic_config,
     save_decision_to_db, save_trade_open, _webhook, bot_instance,
@@ -91,7 +90,7 @@ from adapters import (
 )
 from market import (
     SignalsModule, fetch_global_news, fetch_market_sentiment_data,
-    build_market_context, build_macro_context,
+    build_macro_context,
     calc_indicators, build_kline_series, calc_key_levels,
     fetch_fear_greed, _get_rsi_interval, _get_ma_alignment,
 )
@@ -294,6 +293,10 @@ class StateManager:
                 log.debug(f"_reset_pos: 清理残留 _reserved_margin={self.trader._reserved_margin:.2f}U")
                 self.trader._reserved_margin = 0.0
 
+        # 清除 SL/TP 去重记录，避免新仓位首次调整被误判为重复
+        self.trader.position_exec._last_submitted_sl = 0.0
+        self.trader.position_exec._last_submitted_tp = 0.0
+
     def sync_position(self, symbol: str = None):
         sym = CFG.symbol
         pos  = self.trader.pos
@@ -451,7 +454,7 @@ class StateManager:
 
                 if CFG.enable_auto_case_pool:
                     try:
-                        DB = self.trader.db
+                        DB = get_db_manager()
                         DB.write_sync(
                             "DELETE FROM historical_cases WHERE created_at < datetime('now', '-' || ? || ' days')",
                             (CFG.case_max_age_days,)
@@ -499,6 +502,84 @@ class StateManager:
             log.warning(f"[ATR预热] 失败: {e}")
 
 
+def _compute_1h_regime_score(ind_1h: Dict, price: float, prev_mode: str, funding: Dict) -> float:
+    """计算 1H 时间框架的 regime_score（复用 get_market_mode 函数）。"""
+    try:
+        _, _score = get_market_mode(ind_1h, price, prev_mode, funding)
+        return _score
+    except Exception:
+        return 0.5  # 异常时返回中性值，不拦截
+
+
+# ============================================================
+# 信号纯度评分（Signal Purity Score）
+# 多维度确定性评估 0~1，过滤低质量信号，防止 AI 被矛盾输入干扰
+# ============================================================
+def _calc_signal_purity(ind_15m: dict, ind_1h: dict, ind_4h: dict,
+                        vs_status: dict, depth: dict, funding: dict) -> float:
+    """
+    信号纯度评分 0~1：多维度确定性评估，过滤低质量信号。
+
+    评分项（总分 1.0）：
+      1. VSpike 量能方向纯度   (0.30) — 量能是否强烈且方向明确
+      2. 多时间框架趋势一致性 (0.25) — 15m/1H/4H EMA+ADX 对齐
+      3. 订单簿不平衡强度     (0.20) — OB imbalance 方向性
+      4. 资金费率方向一致性   (0.10) — 连续打分
+      5. CVD 累计方向确认     (0.15) — 吃单流量是否确认 VSpike 方向
+    """
+    score = 0.0
+
+    # ── 1. VSpike 量能方向纯度 (0.30) ──
+    # 不仅看当前 buy_pct，还结合 CVD 确认方向持续性
+    vs_mult   = vs_status.get("mult", 1.0)
+    vs_buy_pct = vs_status.get("buy_pct", 0.5)
+    vs_dir    = vs_status.get("direction", "均衡")
+
+    if vs_mult >= 4.0:
+        # 量能充足时，方向偏度决定纯度
+        dir_extreme = max(vs_buy_pct, 1.0 - vs_buy_pct)  # 0.5~1.0
+        vs_base = (dir_extreme - 0.5) / 0.5              # 归一化到 0~1
+        score += 0.30 * min(1.0, vs_base)
+    else:
+        # 量能不足时，给少量基础分（不完全否定）
+        score += 0.10 * (vs_mult / 4.0)  # 0~0.10
+
+    # ── 2. 多时间框架趋势一致性 (0.25) ──
+    _trend_score, _trend_dir = get_trend_alignment_score(ind_15m, ind_1h, ind_4h)
+    score += _trend_score * 0.25
+    # 震荡极高波动（BB>0.7）额外惩罚 5%
+    _bb_w = ind_15m.get("bb_width", 0.0)
+    if _bb_w > 0.7:
+        score = max(0, score - 0.05)
+
+    # ── 3. 订单簿不平衡强度 (0.20) ──
+    imbal = depth.get("imbalance", 0.0) if depth else 0.0
+    # |imbalance| > 0.5 即给满分
+    score += min(0.20, abs(imbal) * 0.4)
+
+    # ── 4. 资金费率方向一致性 (0.10) — 连续打分 ──
+    fund_rate = funding.get("funding_rate", 0.0) if funding else 0.0
+    if abs(fund_rate) > 0.0001:
+        # |fund| 0.0001→0, 0.0005→0.05, ≥0.001→0.10
+        score += min(0.10, abs(fund_rate) / 0.001 * 0.10)
+
+    # ── 5. CVD 累计方向确认 (0.15) ──
+    # CVD 确认 VSpike 方向 → 加分；CVD 与 VSpike 反向 → 不给分
+    cvd = vs_status.get("cum_delta", 0)
+    cvd_abs = abs(cvd)
+    if cvd_abs > 50:  # 有方向性流量
+        cvd_buy = (cvd > 0)
+        vs_buy_dir = (vs_buy_pct > 0.55)
+        if (cvd_buy and vs_buy_dir) or (not cvd_buy and not vs_buy_dir):
+            score += 0.15  # CVD 确认 VSpike 方向
+        # CVD 与 VSpike 方向冲突 → 不给分（但不扣，避免双重惩罚）
+    else:
+        # CVD 微弱，给一半基础分
+        score += 0.07 * (cvd_abs / 50.0)
+
+    return min(1.0, max(0.0, score))
+
+
 # ============================================================
 # 核心交易引擎
 # ============================================================
@@ -529,7 +610,6 @@ class ETHTrader:
       - self._margin_lock：保证金读写专用锁
     """
     def __init__(self, ai_client: OpenAI):
-        SYM = CFG.symbol  # 整个类内部都用这个常量
         self.trader = OkxTrader()  # 先创建 OkxTrader
         self.trader.eth_trader = self  # 让 OkxTrader 能反向访问 ETHTrader._atr_history
         self.ai     = SmartAIConsultant(ai_client, trader=self.trader)  # 再创建 AI，传入 trader
@@ -554,6 +634,8 @@ class ETHTrader:
         self._last_downgrade_log_ts: float = 0.0
         # 开仓时间戳，用于 WS pos=0 延迟消息保护窗口
         self._last_open_ts: float = 0.0
+        # 翻转计数器（10 分钟滑动窗口，仅监控告警不拦截）
+        self._flip_timestamps: list = []
 
         # ── 缓存 ──────────────────────────────────────────────────────────
         _empty_cache = lambda: {"data": None, "time": datetime.min.replace(tzinfo=UTC)}
@@ -564,7 +646,7 @@ class ETHTrader:
         self.news_cache      = _empty_cache()
         self.fg_cache        = _empty_cache()
         self.sentiment_cache = _empty_cache()
-        self.macro_cache     = {"data": "", "time": datetime.min.replace(tzinfo=UTC)}
+        self.macro_cache     = {"full": "", "short": "", "time": datetime.min.replace(tzinfo=UTC)}
 
         # ── 动态风险因子（根据近7日胜率自动调整，每小时更新）────────────────
         self.dynamic_risk_factor:  float    = 1.0
@@ -582,11 +664,14 @@ class ETHTrader:
         self._last_1h_raw:          List     = []
         self._ind_15m_cache:        Tuple[float, Dict, str] = (0.0, {}, "")
         self._ind_3m_cache:         Tuple[float, Dict, str] = (0.0, {}, "")
+        self._ind_4h_cache:         Tuple[float, Dict, str] = (0.0, {}, "")  # P1: 4H指标600s缓存
         self._last_ob_imbalance:    float = 0.0  # 上轮 OB 失衡度，供 get_dynamic_interval 次轮读取
         # raw K 线缓存：bar → (data, fetch_monotonic, last_candle_ts)
         # TTL 按周期设定：3m=45s, 15m=120s, 1H=300s, 4H=600s
         self._raw_kline_cache: Dict[str, tuple] = {}
         self._RAW_KLINE_TTL: Dict[str, int] = {"3m": 45, "15m": 120, "1H": 300, "4H": 600}
+        # Hurst exponent 缓存：symbol → 近30根15m收益率序列（用于 Regime 复合化评分）
+        self._returns_cache: Dict[str, np.ndarray] = {}
         self._last_adjust_time:     datetime = datetime.min.replace(tzinfo=UTC)
         self._last_trailing_adjust: datetime = datetime.min.replace(tzinfo=UTC)
 
@@ -600,6 +685,8 @@ class ETHTrader:
         self._ai_cache_lock:   threading.Lock = threading.Lock()
         self._ai_hash:         str  = ""
         self._ai_running_flag: bool = False
+        self._ai_gen:          int  = 0     # generation counter，防止旧 worker 覆写新决策
+        self._ai_urgent_gen:   int  = 0     # 紧急请求的最高 generation
         self._ai_thread:       Optional[threading.Thread] = None
         self._last_ai_request_time:   float = 0.0
         self._last_ai_decision_time:  float = 0.0
@@ -612,6 +699,7 @@ class ETHTrader:
         self._last_cvd_reset_ts: str = ""  # 上次CVD重置的15m蜡烛时间戳（用于检测新K线周期）
 
         self._stop = False
+        self._zero_pos_seen_ts: float = 0.0   # 幽灵仓位检测：WS连续返回pos=0的时间戳
         # ── 人工审核控制 ──────────────────────────────────────────────────
         self._ai_blocked: bool = False              # /block_ai 禁用 AI 决策
         # ── 决策摘要队列（最近10次，供 /health 和 /ai/summaries 消费）──────
@@ -620,10 +708,7 @@ class ETHTrader:
         self._last_alert_ts: Dict[str, float] = {}
         # ── 打板信号冷却时间戳（防同一突破在冷却期内重复触发）────────────
         self._last_breakout_ts: Dict[str, float] = {"up": 0.0, "down": 0.0}
-        # ── close被拦截冷却（防同一VSpike事件触发Token死循环）─────────────
-        # 格式：{symbol: {"spike_ts": float, "blocked_until": float}}
-        self._blocked_close_ctx: Dict[str, Dict] = {}
-        # ── 非极端VSpike打破静默冷却（防震荡市密集触发浪费Token）────────────
+        # ── VSpike 非极端事件冷却（防震荡市密集触发浪费 Token）────────────
         # 格式：{symbol: monotonic时间戳}
         self._last_vspike_break_ts: Dict[str, float] = {}
         # AI 平仓协调标志：防止 AI 平仓与追踪止损重复下单
@@ -633,9 +718,12 @@ class ETHTrader:
         # ── 连续 hold 计数 + AI 建议的下次调用间隔（秒）────────────────────
         self._consecutive_hold: int = 0
         self._ai_hold_wait:     int = -1   # -1=未设定，0=AI说立即，其他=指定秒数
+        # ── P2: L1 重复 hold 跳过缓存（120s 内市场状态不变且 L1 仍 hold → 跳过 L1）──
+        self._last_l1_hold_ts:   float = 0.0   # 上次 L1 hold 的 monotonic 时间戳
+        self._last_l1_hold_hash: str = ""      # 上次 L1 hold 时的 input_sig
         # P1-3: 日志限频（key → last_log_monotonic），避免高频循环刷屏
         self._log_throttle: Dict[str, float] = {}
-        # ── AI 强择打破静默（hold 时 AI 可主动要求 force_wakeup）───────────
+        # ── AI force_wakeup 标记（hold 时 AI 可主动要求下轮重评）───────────
         self._last_force_wakeup: Dict[str, bool] = {}   # symbol -> bool
         # ── AI 动态 RSI 唤醒阈值（hold 时 AI 可建议 next_wakeup_rsi）────────
         # None 表示未设定，使用默认静态阈值（40~60）
@@ -650,6 +738,20 @@ class ETHTrader:
         # AI 熔断器：连续5次失败后暂停30分钟，降级为规则引擎
         self._ai_failure_count: int = 0
         self._ai_circuit_broken_until: float = 0.0  # monotonic 时间戳
+        # 启动时间戳：用于启动冷却期（防止首次扫描立即开仓）
+        self._boot_ts: float = time.monotonic()
+        self._boot_dt: datetime = datetime.now(UTC)  # 用于识别重启恢复持仓
+        # 启动冷却期间被拦截的信号跟踪（冷却过期后要求信号/行情已变化）
+        self._post_cooldown_check: Dict[str, Dict] = {}  # {symbol: {"reason": str, "seen_ts": float}}
+
+        # ── 同价位止损冷却 + 连续被洗记忆 ──────────────────────────────
+        self._last_sl_price: float = 0.0          # 上次止损价格
+        self._last_sl_time: float = 0.0            # 上次止损时间(monotonic)
+        self._wash_count_at_price: int = 0         # 同价位区间连续被洗次数
+
+        # ── 双管道 AI 调用优化：空仓决策 vs 持仓管理独立间隔 ────────────
+        self._last_entry_decision_ts:  float = 0.0   # 上次空仓决策时间戳(monotonic)
+        self._last_holding_adjust_ts:   float = 0.0   # 上次持仓调整时间戳(monotonic)
 
         # ── Phase 1: AIGatekeeper ────────────────────────────
         self._ai_gate = AIGatekeeper()
@@ -782,21 +884,11 @@ class ETHTrader:
         # 启动时预热 ATR 历史（确保 RAG 波动率分位在首次决策时即有效）
         self.state._prewarm_atr_history()
 
-        # ── 快速决策通道防抖缓存 ──
-        # 格式: {"sym_SIGNAL_KEY": (action, conf, monotonic_ts)}
-        self._fast_signal_cache: Dict[str, tuple] = {}
         # ── 快速决策拒绝反馈缓存 ──
-        # ConvictionScore 连续拒绝的信号进入冷却，防止低质量信号无限重试
-        # 格式: {"sym_action": (action, reject_count, monotonic_ts)}
-        self._fast_rejection_cache: Dict[str, tuple] = {}
         # ── AI 最近方向性信号跟踪 ──
         # 防止 Path B 用规则引擎信号覆盖 AI 的方向性判断
         # 格式: {"sym": (action, monotonic_ts)}
         self._last_ai_directional: Dict[str, tuple] = {}
-        # ── ConvictionScore 拒绝的决策跟踪 ──
-        # 格式: (action, score, monotonic_ts) — 被 ConvictionScore 拒绝后设置，驱动静默等待
-        self._cv_rejected_decision: tuple = ()
-
     # ============================================================
     # 主交易循环（从 trading_loop.py 合并）
     # ============================================================
@@ -890,7 +982,15 @@ class ETHTrader:
                 return min(300, int(60 * mult))  # 慢车道上限从 600s → 300s
 
         # ── Step 4: 默认间隔 ─────────────────────────────────────────────
-        return CFG.check_interval_hold if has_pos else CFG.check_interval_empty
+        _base = CFG.check_interval_hold if has_pos else CFG.check_interval_empty
+
+        # ── Step 4b: 空仓连续 hold → 拉长间隔，减少空烧 ─────────────────
+        # 连续 2 次 L1 hold + 无 VSpike/快车道信号 → 120s 慢扫
+        if not has_pos and self._consecutive_hold >= 2:
+            log.debug(f"⏸️ [{CFG.symbol}] 空仓连续{self._consecutive_hold}次hold，拉长轮询至120s")
+            return 120
+
+        return _base
 
     def monitoring_loop(self):
         """每10分钟检查一次近期交易表现及 WS 连接健康度"""
@@ -983,67 +1083,11 @@ class ETHTrader:
         except Exception as e:
             log.debug(f"VSpike trades 解析异常: {e}")
 
-    def _check_cooling_preempt(self, osc_market: str) -> bool:
-        """冷却期预判：在调 AI 之前检查是否一定被冷却拦截。
-        返回 False = 冷却期内且无 VSpike 豁免，跳过 AI 调用节省延迟。
-        返回 True = 无冷却阻挡或 VSpike 可能豁免，继续调 AI。
-        注意：此函数只做保守预判——宁可白跑一次，不可错过机会。
-        """
-        try:
-            from core import UTC
-        except ImportError:
-            from datetime import timezone
-            UTC = timezone.utc
-
-        _trend = osc_market == "趋势"
-
-        # ① 平仓冷却预判
-        _last_exit_ts = gs_get("last_exit_ts")
-        if _last_exit_ts:
-            try:
-                _exit_dt = _parse_dt(_last_exit_ts)
-                _seconds_since_exit = (datetime.now(UTC) - _exit_dt).total_seconds() if _exit_dt else 999
-            except Exception:
-                _seconds_since_exit = 999
-
-            # 取最保守的冷却时间（取最大的可能值）
-            _max_exit_cd = 180.0 if not _trend else 90.0  # 震荡同向180s / 趋势同向90s
-
-            if _seconds_since_exit < _max_exit_cd:
-                # 检查 VSpike 是否可能豁免
-                _vs = self.vspike.get_status()
-                _vs_active = _vs.get("is_spike") or _vs.get("spike_recent")
-                _vs_mult = _vs.get("mult", 0)
-                _vs_exempt = 10.0 if _trend else 15.0
-                if _vs_active and _vs_mult >= _vs_exempt:
-                    pass  # VSpike 可能豁免，放行
-                elif _seconds_since_exit < 60.0:
-                    # 刚平仓不到60s，即使反向冷却(60s)也会被拦，直接跳过
-                    return False
-                # 其他情况：无法确定方向，保守放行
-
-        # ② 止损冷却预判
-        if gs_get("consecutive_losses", 0) >= 1:
-            _last_stop_time = gs_get("last_stop_time")
-            if _last_stop_time:
-                try:
-                    _stop_dt = _parse_dt(_last_stop_time)
-                    _minutes_ago = (datetime.now(UTC) - _stop_dt).total_seconds() / 60 if _stop_dt else 999
-                except Exception:
-                    _minutes_ago = 999
-
-                _max_stop_cd = CFG.min_cooldown_after_loss  # 震荡市完整值（最大）
-                if _minutes_ago < _max_stop_cd:
-                    _vs = self.vspike.get_status()
-                    _vs_active = _vs.get("is_spike") or _vs.get("spike_recent")
-                    _vs_mult = _vs.get("mult", 0)
-                    _vs_exempt = 10.0 if _trend else 15.0
-                    if _vs_active and _vs_mult >= _vs_exempt:
-                        pass  # VSpike 可能豁免，放行
-                    else:
-                        return False  # 止损冷却一定生效，跳过 AI
-
-        return True
+    def _get_conviction_open_thresh(self) -> float:
+        """根据市场模式返回开仓 ConvictionScore 门槛：震荡 57 / 趋势 53。"""
+        if self._market_mode in ("震荡", "震荡激进"):
+            return CFG.osc_conviction_open_min
+        return CFG.conviction_open_min
 
     def _check_aggressive_conflict_cooldown(self) -> bool:
         """AGGRESSIVE 冲突冷却：多空冲突后方向未变，跳过 AI 调用复用 hold。
@@ -1086,272 +1130,181 @@ class ETHTrader:
 
     def _should_skip_ai_request(self, symbol: str, ind_15m: Dict, ind_1h: Dict, current_price: float) -> bool:
         """
-        静默拦截：持仓时若市场无明显变化且未超过静默期，则跳过AI请求。
-        对空仓同样生效（垃圾时间直接跳过）。
-        返回 True 表示应该跳过 AI 请求，使用缓存决策或默认 hold。
+        检查是否应该跳过 AI 请求。
+        静默拦截已全面禁用，持仓/空仓均由缓存 TTL 控制频率。
+        保留：AI 熔断、VSpike 冷却/反转检测、浮亏/浮盈告警。
+        返回 True 表示跳过，False 表示继续调 AI。
         """
-        # AI 熔断器：连续5次失败后暂停30分钟，降级为规则引擎
-        now_mono = time.monotonic()
+        # AI 熔断器
         if self._ai_gate.circuit_broken:
-            log.warning(f"🛑 [{symbol}] AI 熔断中（AIGatekeeper），跳过 AI 请求")
+            log.warning(f"🛑 [{symbol}] AI 熔断中，跳过 AI 请求")
             return True
 
-        # ── AI 主动打破静默（force_wakeup）—— 最高优先级，立即生效 ─────────
+        # AI force_wakeup —— 清除缓存立即重评
         if self._last_force_wakeup.get(symbol, False):
-            log.info(f"⚡ [{symbol}] 上轮 AI 输出 force_wakeup=true，本轮强制唤醒")
-            self._last_force_wakeup[symbol] = False  # 用完清除
-            self.fast_lane._clear_ai_cache(symbol=symbol)  # 清缓存，确保真实 AI 调用
+            log.info(f"⚡ [{symbol}] 上轮 AI force_wakeup，清除缓存重评")
+            self._last_force_wakeup[symbol] = False
+            self.fast_lane._clear_ai_cache(symbol=symbol, clear_last=True)
             return False
 
-        # ── 秒级成交量突增 → 打破静默，让 AI 看到 VSpike 上下文 ─────────
-        if self.vspike.get_status().get("is_spike"):
-            # close被拦截冷却检查：同一spike事件内AI已反复拦截，暂停重复调用
-            _bctx = self._blocked_close_ctx.get(symbol, {})
+        # VSpike 突增 → 分级冷却清缓存
+        _vs_status = self.vspike.get_status()
+        if _vs_status.get("is_spike"):
+            _vs_mult = _vs_status.get("mult", 1.0)
             _now_mono_vs = time.monotonic()
-            _spike_peak_ts = self.vspike._spike_peak_ts
-            # 若是同一spike事件（peak_ts相同）且冷却期未过 → 跳过，不打破静默
-            # VSpike 极端值 (≥10x) 豁免 close 拦截冷却
-            _vs_mult_extreme = self.vspike.get_status().get("mult", 0.0)
-            _is_extreme = _vs_mult_extreme >= CFG.vspike_extreme_mult
-            if (_bctx.get("spike_ts") == _spike_peak_ts
-                    and _now_mono_vs < _bctx.get("blocked_until", 0)
-                    and not _is_extreme):  # 极端 VSpike 豁免冷却
-                _remain = _bctx["blocked_until"] - _now_mono_vs
-                log.debug(f"🛑 [{symbol}] close拦截冷却中（同一spike事件，剩余{_remain:.0f}s），跳过AI唤醒")
-                return True
-            # ── 非极端VSpike打破静默冷却（防震荡市密集触发浪费Token）─────────
-            # 极端值(≥10x)无条件通过，普通spike需间隔 VSPIKE_SILENCE_BREAK_CD 秒
-            if not _is_extreme:
-                _last_break = self._last_vspike_break_ts.get(symbol, 0.0)
-                _cd = CFG.vspike_silence_break_cd
-                _elapsed = _now_mono_vs - _last_break
-                if _elapsed < _cd:
-                    _remain_cd = _cd - _elapsed
-                    log.debug(f"⏸️ [{symbol}] VSpike {_vs_mult_extreme:.1f}x 非极端，打破静默冷却中（剩余{_remain_cd:.0f}s），跳过")
-                    return True
-            if _is_extreme:
-                log.info(f"⚡ [{symbol}] VSpike 极端值 ({_vs_mult_extreme:.1f}x) 豁免所有冷却")
-            # ── P0-1: VSpike 反转检测（震荡市防双向来回砍）──────────────────────
-            # 近10分钟内若 VSpike 方向翻转（买方→卖方 或反之），说明是流动性扫单噪声
-            # 震荡/震荡激进市降级 hold，趋势市仅警告（趋势市方向更可靠）
-            _reversal = self.vspike.has_recent_reversal(lookback_secs=600.0, min_mult=3.0)
-            if _reversal["reversed"] and not _is_extreme:
-                if self._market_mode in ("震荡", "震荡激进"):
-                    log.warning(
-                        f"🔄 [{symbol}] VSpike 反转检测：{_reversal['detail']} | "
-                        f"震荡市降级 hold，避免双向来回砍"
-                    )
-                    return True  # 跳过 AI 唤醒，维持静默
+
+            # ── 分级冷却：极端→零延迟 / 中强→120s / 弱→180s ──
+            _last_clear = gs_get("last_vspike_cache_clear_ts", 0.0)
+            if _vs_mult >= 8.0:
+                _min_gap = 0.0
+                _tag = "极端"
+            elif _vs_mult >= 5.0:
+                _min_gap = 120.0
+                _tag = "中强"
+            else:
+                _min_gap = 180.0
+                _tag = "弱"
+
+            if _now_mono_vs - _last_clear < _min_gap:
+                log.debug(
+                    f"⏸️ [{symbol}] VSpike {_vs_mult:.1f}x ({_tag}) 清缓存冷却中 "
+                    f"（需{_min_gap:.0f}s，已过{(_now_mono_vs - _last_clear):.0f}s），跳过清缓存，AI 请求继续"
+                )
+                # 只跳过清缓存，AI 请求正常走
+                return False
+
+            # ── 全局最小间隔保护：任何情况下清缓存后 45s 内不允许再次清缓存 ──
+            _last_ai_req = self._ai_gate.last_request_ts
+            if _last_ai_req > 0 and (_now_mono_vs - _last_ai_req) < 45.0:
+                log.debug(
+                    f"⏸️ [{symbol}] VSpike {_vs_mult:.1f}x 清缓存被全局最小间隔保护 "
+                    f"（距上次AI调用 {(_now_mono_vs - _last_ai_req):.0f}s < 45s），跳过清缓存，AI 请求继续"
+                )
+                # 只跳过清缓存，AI 请求正常走
+                return False
+
+            # ── 反转检测（震荡市防双向来回砍）──
+            _rev_min_mult = 4.0 if self._market_mode in ("震荡", "震荡激进") else 3.0
+            _reversal = self.vspike.has_recent_reversal(lookback_secs=600.0, min_mult=_rev_min_mult)
+            if _reversal["reversed"] and _vs_mult < 8.0:
+                _first_mult = _reversal.get("first_mult", 0.0)
+                _magnitude_surge = (_vs_mult >= _first_mult * 1.8)
+                _has_pos = bool(self.pos.side)
+                _dir_consistent = False
+                if _has_pos:
+                    _new_dir_is_long = (_reversal["second_dir"] == "买方主导")
+                    _pos_is_long = (self.pos.side == "long")
+                    _dir_consistent = (_new_dir_is_long == _pos_is_long)
                 else:
+                    _dir_consistent = True
+                if _magnitude_surge and _dir_consistent:
                     log.info(
-                        f"🔄 [{symbol}] VSpike 反转警告（趋势市放行）：{_reversal['detail']}"
+                        f"🚦 [{symbol}] 反转检测豁免：新VSpike {_vs_mult:.1f}x ≥ "
+                        f"{_reversal['first_mult']:.1f}x×1.8，放行决策"
                     )
-            self._last_vspike_break_ts[symbol] = _now_mono_vs  # 记录本次打破静默时间
-            log.info(f"🔥 [{symbol}] 秒级成交量突增，打破静默重新决策")
-            self.fast_lane._clear_ai_cache(symbol=symbol)  # 强制清缓存，确保 AI 真实调用（而非返回旧 hold）
-            # VSpike打破静默时同步清除BREAKOUT防抖缓存，防止同一轮打板信号因300s冷却被误杀
-            for _bkey in (f"{symbol}_BREAKOUT_UP", f"{symbol}_BREAKOUT_DOWN"):
-                self._fast_signal_cache.pop(_bkey, None)
-            # ── VSpike 快车道打标：极端量能时激活 AGGRESSIVE 模式 ─────────────
-            _vs_mult_now = self.vspike.get_status().get("mult", 0.0)
-            if _vs_mult_now >= CFG.vspike_priority_threshold:
-                self._ai_gate.mark_entry_fasttrack(_vs_mult_now)
+                else:
+                    if self._market_mode in ("震荡", "震荡激进"):
+                        log.warning(
+                            f"🔄 [{symbol}] VSpike 反转检测：{_reversal['detail']} | "
+                            f"震荡市降级 hold，避免双向来回砍"
+                        )
+                        return True
+                    else:
+                        log.info(
+                            f"🔄 [{symbol}] VSpike 反转警告（趋势市放行）：{_reversal['detail']}"
+                        )
+
+            gs_set("last_vspike_cache_clear_ts", _now_mono_vs)
+            log.info(f"🔥 [{symbol}] VSpike {_vs_mult:.1f}x ({_tag}) → 清除缓存刷新决策")
+            self.fast_lane._clear_ai_cache(symbol=symbol, clear_last=True)
+            if _vs_mult >= CFG.vspike_priority_threshold:
+                self._ai_gate.mark_entry_fasttrack(_vs_mult)
                 log.info(
                     f"[AIGatekeeper] Mode: AGGRESSIVE | "
-                    f"Reason: VSpike={_vs_mult_now:.1f}x >= {CFG.vspike_priority_threshold:.0f}x | "
+                    f"Reason: VSpike={_vs_mult:.1f}x >= {CFG.vspike_priority_threshold:.0f}x | "
                     f"Bypassing Cache: True"
                 )
             return False
 
-        # ── 垃圾时间过滤（对空仓和持仓都生效）───────────────────────────
-        # 注意：_consecutive_hold 计数器统一在 _run_symbol 主逻辑中管理，
-        # 此处仅负责判断是否跳过，不单独增量（避免重复计数）。
-        # ── 1H ADX + Regime 双重过滤：极弱震荡 = 物理垃圾时间 ───────────────
-        # 1H ADX < 20 → 无趋势；Regime < 0.3 → 市场骨架极弱
-        # 两者同时满足 → "10x杠杆进去就是送手续费"，直接跳过 AI 节省 Token
-        # 豁免条件：VSpike ≥6.0x 时，强成交量信号本身已构成开仓依据，值得 AI 判断
-        _adx_1h = ind_1h.get("adx", 25) if ind_1h else 25
-        _regime = ind_15m.get("regime_score", 0.5)
-        _phys_spike = self.vspike.get_status()
-        _phys_spike_mult = _phys_spike.get("mult", 0.0) if (
-            _phys_spike.get("is_spike") or _phys_spike.get("spike_recent")
-        ) else 0.0
-        if _adx_1h < 20 and _regime < 0.3 and _phys_spike_mult < 6.0:
-            # P1-3: 限频，垃圾时间日志每120秒最多输出一次INFO
-            if self._should_log(f"junk_{symbol}", 120.0):
-                log.info(
-                    f"🛡️ [{symbol}] 物理拦截：1H_ADX({_adx_1h:.1f})<20 且 Regime({_regime:.2f})<0.3"
-                    f" → 极弱震荡，无操作价值，跳过AI节省Token"
-                    f"（VSpike={_phys_spike_mult:.1f}x < 6.0 无豁免）"
-                )
-            return True
-
-        _market_mode = get_market_mode(ind_15m, current_price, self._market_mode)
-        _rsi = ind_15m.get("rsi", 50)
-        # 动态 RSI 阈值：优先使用 AI 上次 hold 决策时建议的范围，否则使用默认 [40, 60]
-        _rsi_low, _rsi_high = self._next_wakeup_rsi if self._next_wakeup_rsi else (40, 60)
-        if (_market_mode == "震荡"
-                and _rsi_low <= _rsi <= _rsi_high):
-            kl = self.key_levels_cache.get("data") or {}
-            if kl.get("_valid"):
-                res = kl.get("resistances", [])
-                sup = kl.get("supports", [])
-                if res or sup:
-                    def _d(levels):
-                        return min(abs(current_price - (float(l["price"]) if isinstance(l, dict) else float(l))) / current_price
-                                   for l in levels) if levels else float("inf")
-                    nearest = min(_d(res), _d(sup))
-                    if nearest > 0.01:
-                        _dyn_tag = f"(AI动态阈值{self._next_wakeup_rsi})" if self._next_wakeup_rsi else "(默认阈值40~60)"
-                        log.debug(f"🗑️ [{symbol}] 垃圾时间跳过AI：震荡/RSI={_rsi:.0f}{_dyn_tag}/距关键位>{nearest*100:.1f}%")
-                        return True
-
+        # 浮亏/浮盈告警（仅持仓）
         pos = self.pos
-        if not pos or not pos.side:
-            # 无持仓（且非垃圾时间），不触发静默拦截
-            return False
-
-        # ── 浮亏/浮盈超限强制唤醒（防止静默拦截冻住亏损或踏空浮盈持仓）─────────
-        if pos.entry_price > 0 and current_price > 0:
+        if pos and pos.side and pos.entry_price > 0 and current_price > 0:
             if pos.side == "long":
                 _pos_pnl_pct = (current_price - pos.entry_price) / pos.entry_price
             else:
                 _pos_pnl_pct = (pos.entry_price - current_price) / pos.entry_price
+            _now_mono_alert = time.monotonic()
             if _pos_pnl_pct <= CFG.silence_force_wakeup_loss_pct:
-                log.warning(
-                    f"⚠️ [{symbol}] 浮亏 {_pos_pnl_pct*100:.2f}% ≤ {abs(CFG.silence_force_wakeup_loss_pct)*100:.0f}%，"
-                    f"强制唤醒 AI 重新决策"
-                )
-                _now_mono_alert = time.monotonic()
                 _cooldown = CFG.silence_wakeup_alert_cooldown
                 if _now_mono_alert - self._last_alert_ts.get("wakeup_loss", 0) >= _cooldown:
                     self._last_alert_ts["wakeup_loss"] = _now_mono_alert
+                    log.warning(f"🚨 [{symbol}] 浮亏 {_pos_pnl_pct*100:.2f}%，当前价:{current_price}")
                     _webhook(
-                        f"🚨 [{CFG.symbol}] 浮亏强制唤醒",
+                        f"🚨 [{CFG.symbol}] 浮亏告警",
                         f"方向:{pos.side} 浮亏:{_pos_pnl_pct*100:.2f}% 当前价:{current_price}"
                     )
-                self.fast_lane._clear_ai_cache(symbol=symbol)  # 清缓存，确保 AI 真实看到浮亏状态
-                return False
             _atr_wakeup = ind_15m.get("atr", 0)
             _atr_dollar_trigger = _atr_wakeup * CFG.silence_force_wakeup_atr_mult
             if _atr_wakeup > 0 and (_pos_pnl_pct * current_price) >= _atr_dollar_trigger:
-                log.warning(
-                    f"⚠️ [{symbol}] 浮盈 {_pos_pnl_pct*100:.2f}% ≥ {CFG.silence_force_wakeup_atr_mult}×ATR(≈${_atr_dollar_trigger:.2f})，"
-                    f"强制唤醒 AI 考虑止盈/加仓"
-                )
-                _now_mono_alert = time.monotonic()
                 _cooldown = CFG.silence_wakeup_alert_cooldown
                 if _now_mono_alert - self._last_alert_ts.get("wakeup_profit", 0) >= _cooldown:
                     self._last_alert_ts["wakeup_profit"] = _now_mono_alert
+                    log.warning(f"📈 [{symbol}] 浮盈 {_pos_pnl_pct*100:.2f}% ≥ {CFG.silence_force_wakeup_atr_mult}×ATR，当前价:{current_price}")
                     _webhook(
-                        f"📈 [{CFG.symbol}] 浮盈强制唤醒",
+                        f"📈 [{CFG.symbol}] 浮盈告警",
                         f"方向:{pos.side} 浮盈:{_pos_pnl_pct*100:.2f}% 当前价:{current_price}"
                     )
-                self.fast_lane._clear_ai_cache(symbol=symbol)  # 清缓存，确保 AI 真实看到浮盈状态
-                return False
 
-        now_mono = time.monotonic()
-        holding_seconds = (datetime.now(UTC) - pos.open_time).total_seconds() if pos.open_time else 0
-        holding_minutes = holding_seconds / 60
-
-        # 距离上次 AI 请求时间
-        last_request_time = self._ai_gate.last_request_ts
-        time_since_request = now_mono - last_request_time
-        silence_threshold = CFG.max_hold_silence_minutes * 60  # 转换为秒
-
-        # 超过最大静默时长，强制唤醒（硬熔断，防止"冻死"）
-        if time_since_request >= silence_threshold:
-            log.warning(
-                f"⏰ [{symbol}] 静默超限（{holding_minutes:.0f}分钟），强制刷新 AI"
-            )
-            self.fast_lane._clear_ai_cache(symbol=symbol)  # 清缓存，确保触发真实 AI 调用
-            return False
-
-        # 无持仓，不拦截
-        if not pos.side:
-            return False
-
-        # ── 动态价格波动阈值（趋势市更敏感，震荡市更宽容）─────────────────
-        _price_thresh = (
-            CFG.hold_silence_price_thresh_trend
-            if _market_mode == "趋势"
-            else CFG.hold_silence_price_thresh_osc
-        )
-        # 检查价格波动（若上次AI决策价格不存在，用持仓成本价作基准）
-        last_price = self._ai_gate.last_decision_price
-        price_change_pct = 0.0
-        if last_price > 0:
-            price_change_pct = abs(current_price - last_price) / last_price
-            if price_change_pct >= _price_thresh:
-                # 价格波动超过动态阈值，不拦截
-                return False
-
-        # 检查关键指标变化
-        current_rsi = ind_15m.get("rsi", 50)
-        current_macd_hist = ind_15m.get("macd_hist", 0)
-        last_rsi = self._ai_gate.last_decision_rsi
-        last_macd_hist = self._ai_gate.last_decision_macd
-
-        # RSI 从非超买/超卖区进入超买/超卖区
-        rsi_was_overbought = last_rsi >= 65
-        rsi_now_overbought = current_rsi >= 65
-        rsi_was_oversold = last_rsi <= 35
-        rsi_now_oversold = current_rsi <= 35
-        rsi_entered_extreme = (rsi_now_overbought and not rsi_was_overbought) or (rsi_now_oversold and not rsi_was_oversold)
-
-        # MACD 死叉/金叉（方向变化）
-        macd_crossed = (current_macd_hist > 0 and last_macd_hist <= 0) or (current_macd_hist < 0 and last_macd_hist >= 0)
-
-        # 有显著指标变化，不拦截
-        if rsi_entered_extreme or macd_crossed:
-            return False
-
-        # 满足所有静默条件，跳过 AI 请求
-        log.debug(f"🛡️ [{symbol}] 静默拦截：持仓{holding_minutes:.0f}分钟 价格波动{price_change_pct*100:.2f}% <{_price_thresh*100:.1f}% RSI={current_rsi:.1f} MACD={current_macd_hist:.4f}")
-        return True
-
-    def _is_redundant_fast_signal(self, sym: str, signal_key: str,
-                                   action: str, conf: float,
-                                   cooldown: int = 300,
-                                   force_bypass: bool = False) -> bool:
-        """
-        快速信号防抖：同一信号源在 cooldown 秒内出现相同 action + conf 变化 <= 0.05 则拦截，
-        避免重复 AI 调用烧 token。
-        两个逃生条件：
-        - force_bypass=True（VSpike 剧烈波动时绕过防抖）
-        - new_conf > prev_conf + 0.10（信号显著增强，允许突破）
-        使用 time.monotonic() 防止系统时钟回拨。
-        """
-        if force_bypass:
-            self._fast_signal_cache[f"{sym}_{signal_key}"] = (action, conf, time.monotonic())
-            return False
-
-        now = time.monotonic()
-        cache_key = f"{sym}_{signal_key}"
-        cached = self._fast_signal_cache.get(cache_key)
-
-        if cached:
-            prev_action, prev_conf, prev_ts = cached
-            conf_improved = conf > prev_conf + 0.10
-            if (prev_action == action
-                    and abs(prev_conf - conf) <= 0.05
-                    and not conf_improved
-                    and (now - prev_ts) < cooldown):
-                log.debug(
-                    f"[{sym}] {signal_key} 防抖拦截 "
-                    f"(action={action} conf={conf:.2f} vs 前次 {prev_conf:.2f} "
-                    f"{'+0.10突破' if conf_improved else ''})"
-                )
-                return True
-
-        self._fast_signal_cache[cache_key] = (action, conf, now)
+        # 不做任何静默拦截，由缓存 TTL 控制频率
         return False
+
+    # ── P4 辅助方法：统一安全读取AI决策（防None降级）──
+    def _safe_ai_decision(self, symbol: str, ind_15m, fallback_reason: str) -> Dict:
+        """统一入口：读取缓存决策，None 时降级为 hold。"""
+        decision = self.fast_lane._get_ai_decision(symbol, atr_ratio=ind_15m.get("atr_ratio") if ind_15m else None)
+        if decision is None:
+            return {"action": "hold", "confidence": 0.5, "reason": fallback_reason}
+        return decision
+
+    # ── P0 辅助函数：多周期对齐状态粗粒度桶（缓存Key用）──
+    @staticmethod
+    def _calc_tf_align_bucket(ind_1h: Dict, ind_4h: Dict) -> str:
+        """返回4种多周期对齐状态之一，用于AI缓存Key。
+        仅依赖1H/4H的trend+RSI+MACD，零额外计算。
+        """
+        _bull = 0
+        for _ind in (ind_1h, ind_4h):
+            if not _ind:
+                continue
+            if _ind.get("trend", "") == "UP":
+                _bull += 1
+            elif _ind.get("trend", "") == "DOWN":
+                _bull -= 1
+            _rsi = _ind.get("rsi", 50)
+            if _rsi > 55:
+                _bull += 1
+            elif _rsi < 45:
+                _bull -= 1
+            _macd = _ind.get("macd_hist", 0)
+            if _macd > 0:
+                _bull += 1
+            elif _macd < 0:
+                _bull -= 1
+        if _bull >= 3:
+            return "TF_BULL"
+        elif _bull <= -3:
+            return "TF_BEAR"
+        elif _bull >= 1:
+            return "TF_SLIGHT_BULL"
+        elif _bull <= -1:
+            return "TF_SLIGHT_BEAR"
+        return "TF_NEUTRAL"
 
     def _trigger_ai_async_sym(self, symbol: str, ind_15m, ind_1h, ind_4h, ind_3m,
                                news_data, fg_index, funding, depth, pos_info,
                                key_levels=None, market_sentiment=None,
                                funding_history=None, macro_context="", rag_warning="",
-                               sentiment_alert="", fast_context=""):
+                               sentiment_alert="", fast_context="", vs_frozen=None):
         """Per-symbol non-blocking AI trigger"""
         # ── 人工禁用 AI 检查（/block_ai 命令触发）───────────────────────
         if self._ai_blocked:
@@ -1361,19 +1314,31 @@ class ETHTrader:
         now_mono = time.monotonic()
         min_interval = CFG.ai_min_request_interval
         if now_mono - self._ai_gate.last_request_ts < min_interval:
-            log.debug(f"⏳ [{symbol}] AI请求间隔小于{min_interval}秒，跳过")
+            log.info(f"⏩ [{symbol}] AI 请求间隔未达 {min_interval}s，跳过")
             return
 
-        # 注：持仓静默拦截已由 _should_skip_ai_request 在 _run_symbol 中统一处理，此处无需重复
+        # 注：持仓请求拦截已由 _should_skip_ai_request 在 _run_symbol 中统一处理，此处无需重复
 
         if self._ai_running_flag:
-            log.debug(f"⏩ [{symbol}] AI 上轮仍运行，跳过")
-            return
+            # VSpike 极端量能时，废弃当前运行中的旧 worker，启动新 worker
+            _vs_pre = self.vspike.get_status()
+            _vs_mult_pre = _vs_pre.get("mult", 0.0) if hasattr(_vs_pre, "get") else 0.0
+            if _vs_mult_pre >= 6.0:
+                self._ai_gen += 1
+                self._ai_urgent_gen = self._ai_gen
+                log.info(f"⚡ [{symbol}] VSpike {_vs_mult_pre:.1f}x 紧急抢占，废弃旧AI worker (gen→{self._ai_gen})，立即启动新决策")
+            else:
+                log.info(f"⏩ [{symbol}] AI 上轮仍运行，跳过（需等待完成或 VSpike≥6x 紧急抢占）")
+                return
         try:
             # ── 缓存键模糊化（降低敏感度，提升命中率）──────────────────────
             _price_raw = ind_15m.get('price', 0)
-            market_mode = get_market_mode(ind_15m, _price_raw, self._market_mode)
-            self._market_mode = market_mode
+            _osc_mode, _regime_score = get_market_mode(
+                ind_15m, _price_raw, self._market_mode,
+                funding=funding, returns_30=self._returns_cache.get(symbol)
+            )
+            ind_15m["regime_score"] = _regime_score
+            self._market_mode = _osc_mode
 
             # ① RSI 宽分桶：0-30(超卖) / 30-45(偏弱) / 45-55(中性) / 55-70(偏强) / 70-100(超买)
             _rsi = ind_15m.get('rsi', 50)
@@ -1394,22 +1359,28 @@ class ETHTrader:
 
             # ③ 价格漂移容忍：偏离上次决策价 < 0.3% → 连哈希都不用算，直接复用缓存
             # 修复：必须前提是当前缓存还有效（未过期且不为 None）
-            _active_cache = self.fast_lane._get_ai_decision(symbol)
+            _active_cache = self.fast_lane._get_ai_decision(symbol, atr_ratio=ind_15m.get("atr_ratio") if ind_15m else None)
             _last_price = self._ai_gate.last_decision_price
             _last_rsi_bkt = self._ai_gate._last_rsi_bkt
             _last_bb_zone = self._ai_gate._last_bb_zone
-            if (_active_cache is not None
+            # VSpike 活跃时跳过漂移检查（量能突增代表市场结构变化，不应复用旧缓存）
+            _vs_skip_drift = False
+            if _active_cache is not None:
+                _vs_check = self.vspike.get_status()
+                _vs_skip_drift = _vs_check.get("is_spike") or _vs_check.get("spike_recent")
+            if (not _vs_skip_drift
+                    and _active_cache is not None
                     and _last_price > 0 and _last_rsi_bkt is not None and _last_bb_zone is not None):
                 _price_drift = abs(_price_raw - _last_price) / _last_price
                 if _price_drift < 0.003 and _rsi_bkt == _last_rsi_bkt and _bb_zone == _last_bb_zone:
                     # 价格稳定 + RSI/BB% 未跨桶 → 复用缓存
                     cached = _active_cache
-                    log.debug(f"⏭️ [{symbol}] 漂移 {_price_drift*100:.2f}% < 0.3% + RSI/BB%未变，直接复用缓存 → "
+                    log.info(f"⏩ [{symbol}] 价格漂移 {_price_drift*100:.2f}% < 0.3% + RSI/BB%未变，复用缓存 → "
                               f"{cached.get('action','?')} (conf={cached.get('confidence',0):.2f})")
                     return
 
             # ④ 价格分桶：趋势市 $20 / 震荡市 $10
-            if market_mode == "趋势":
+            if _osc_mode == "趋势":
                 price_bucket = CFG.cache_price_bucket_trending
             else:
                 price_bucket = CFG.cache_price_bucket_osc
@@ -1430,25 +1401,61 @@ class ETHTrader:
                 f"{_fund_sgn}_"
                 f"{holding_minutes}_"
                 f"{pos_info.get('side')}_"
-                f"{market_mode}_"
-                f"{_vol_bkt}"  # 量能分桶：量能突变（如放量2倍）时触发AI刷新
+                f"{_osc_mode}_"
+                f"{_vol_bkt}_"          # 量能分桶
+                f"{_calc_tf_align_bucket(ind_1h, ind_4h)}"  # P0: 多周期对齐状态
             )
         except Exception:
             input_sig = ""
 
-        # 强制刷新逻辑：高置信度信号（>= cache_force_refresh_conf）触发强制刷新
-        # 修复：再次通过 _get_ai_decision 确认缓存未过期，避免引用已被清除的缓存
-        _active_cache = self.fast_lane._get_ai_decision(symbol)
+        # ── 先获取当前缓存状态 ────────────────────────────────────────────────
+        _active_cache = self.fast_lane._get_ai_decision(symbol, atr_ratio=ind_15m.get("atr_ratio") if ind_15m else None)
+
+        # ── 持仓 + 接近关键价位 → 缓存缩短到 30 秒（关键位置不容忍延迟）───
+        if pos_info.get("side"):
+            _near_level = False
+            _price_for_level = ind_15m.get("price", 0) if ind_15m else 0
+            if key_levels and key_levels.get("_valid") and _price_for_level > 0:
+                for _ll in key_levels.get("supports", []) + key_levels.get("resistances", []):
+                    _lvl_price = _ll.get("price", 0) if isinstance(_ll, dict) else 0
+                    if _lvl_price > 0 and abs(_price_for_level - _lvl_price) / _price_for_level <= CFG.level_proximity_thresh:
+                        _near_level = True
+                        break
+            if _near_level and _active_cache is not None:
+                _cache_age = time.monotonic() - self._ai_gate._cache_ts if self._ai_gate._cache_ts > 0 else 999
+                if _cache_age > 30:
+                    log.info(f"⚡ [{symbol}] 持仓接近关键价位，缓存已{_cache_age:.0f}s>30s，强制刷新")
+                    self.fast_lane._clear_ai_cache(symbol=symbol)
+                    _active_cache = None  # 强制走 AI 调用
+
         prev_conf = _active_cache.get("confidence", 0) if _active_cache else 0
         if prev_conf >= CFG.cache_force_refresh_conf and self._ai_hash == input_sig:
             log.debug(f"🔄 [{symbol}] 高置信度缓存({prev_conf:.2f}>={CFG.cache_force_refresh_conf})，强制刷新")
         elif input_sig == self._ai_hash and _active_cache is not None:
-            # 缓存命中时只打印精简日志，避免刷屏
-            log.debug(f"⏭️ [{symbol}] 命中AI缓存 → {_active_cache.get('action','?')} (conf={_active_cache.get('confidence',0):.2f})")
+            # 缓存命中
+            log.info(f"⏩ [{symbol}] AI缓存命中 → {_active_cache.get('action','?')} (conf={_active_cache.get('confidence',0):.2f})")
+            return
+
+        # ── P2/P3: L1 重复 hold 跳过 → 已禁用（用户要求不省 token，每次缓存 miss 都调 L1）──
+        _now_mono_p2 = time.monotonic()
+        _l1_hold_age = _now_mono_p2 - self._last_l1_hold_ts
+        _l1_hold_limit = 0  # 禁用重复 hold 跳过，每次都调 L1
+        if (_l1_hold_age < _l1_hold_limit
+                and input_sig == self._last_l1_hold_hash
+                and _active_cache is not None
+                and _active_cache.get("action") in ("hold", "skip")):
+            log.debug(
+                f"⏭️ [{symbol}] L1 重复 hold 跳过（{_l1_hold_age:.0f}s < {_l1_hold_limit}s({_osc_mode}) + "
+                f"市场状态未变），复用缓存 → {_active_cache.get('reason','')[:40]}"
+            )
             return
 
         def _worker():
             self._ai_running_flag = True
+            _my_gen = self._ai_gen  # 捕获当前 generation，用于检测是否有紧急抢占
+            _worker_start_ts = time.monotonic()  # 用于竞态检测：clear 在启动之后发生 → 丢弃
+            _vs_info = self.vspike.get_status()
+            log.info(f"🚀 [{symbol}] AI worker 启动（mode={self._market_mode}, vspike={_vs_info.get('mult',0):.1f}x）")
             semaphore_acquired = False
             _failure_counted = False  # 防止双重计数
             # 在任何局部赋值之前，先提取 ind_15m 的值（避免 Python 将 ind_15m 视为局部变量）
@@ -1463,9 +1470,10 @@ class ETHTrader:
                 self.ai.tick_size = tick
                 # AI 并发限流：同一时刻只有1个品种占用 DeepSeek
                 _acquire_start = time.monotonic()
-                acquired = self._ai_semaphore.acquire(timeout=CFG.ai_timeout_seconds + 10)
+                acquired = self._ai_semaphore.acquire(timeout=CFG.ai_timeout_seconds * max(1, CFG.ai_max_retries) + 30)
                 if not acquired:
-                    log.warning(f"⚠️ [{symbol}] AI 信号量等待超时({CFG.ai_timeout_seconds + 10}s)，跳过本轮")
+                    _sem_to = CFG.ai_timeout_seconds * max(1, CFG.ai_max_retries) + 30
+                    log.warning(f"⚠️ [{symbol}] AI 信号量等待超时({_sem_to}s)，跳过本轮")
                     self._ai_running_flag = False
                     # 超时表示 permit 被本次失败的 acquire 消耗，必须补 release 恢复，否则后续所有 AI 调用永久阻塞
                     self._ai_semaphore.release()
@@ -1494,15 +1502,19 @@ class ETHTrader:
                     _use_ind15, _use_ind1h, _use_ind4h)
 
                 try:
-                    # ── Prompt 注入极端量能特权指令 ───────────────────────────────
+                    # ── Prompt 注入量能事件指令（三级：无/中间级/AGGRESSIVE）──
                     _ft_mult = self._ai_gate.entry_fasttrack_mult
-                    if _ft_mult >= CFG.vspike_priority_threshold:
-                        # 获取当前 VSpike 状态，注入方向警告
-                        _vs_ctx = self.vspike.get_status()
-                        _vs_dir_ctx = _vs_ctx.get("direction", "均衡")
-                        _vs_bp = _vs_ctx.get("buy_pct", 0.5)
+                    _vs_ctx = self.vspike.get_status()
+                    _vs_dir_ctx = _vs_ctx.get("direction", "均衡")
+                    _vs_bp = _vs_ctx.get("buy_pct", 0.5)
+                    _vs_mult_now = _vs_ctx.get("mult", 0.0)
+                    _vs_spike_active = _vs_ctx.get("is_spike") or _vs_ctx.get("spike_recent")
+                    _effective_mult = max(_ft_mult, _vs_mult_now) if _vs_spike_active else _ft_mult
+
+                    if _effective_mult >= CFG.vspike_priority_threshold:
+                        # ── AGGRESSIVE 模式（≥15x）：极端量能特权 ──
                         _vs_dir_warn = ""
-                        if _ft_mult >= 15.0:
+                        if _effective_mult >= 15.0:
                             if _vs_dir_ctx == "卖方主导" and _vs_bp < 0.25:
                                 _vs_dir_warn = (
                                     f"⚠️ 当前为极端卖方主导量能事件（{100*_vs_bp:.0f}%卖盘），"
@@ -1516,14 +1528,28 @@ class ETHTrader:
                                     f"已成交流量方向优先级 > 订单簿静态结构。\n"
                                 )
                         _aggressive_ctx = (
-                            f"【⚡ 极端量能特权模式 VSpike={_ft_mult:.1f}x】\n"
-                            f"当前成交量是基准的{_ft_mult:.0f}倍，属于历史极值事件。\n"
+                            f"【⚡ 极端量能特权模式 VSpike={_effective_mult:.1f}x】\n"
+                            f"当前成交量是基准的{_effective_mult:.0f}倍，属于历史极值事件。\n"
                             f"决策指令：将订单流/成交量动力学权重提升至80%，"
                             f"RSI/MACD等滞后指标仅作辅助参考（权重≤20%）。\n"
                             f"若订单流方向明确（buy_pct>65%看多/buy_pct<35%看空），"
                             f"即使技术指标有背离，也应果断顺势决策。\n"
                             f"{_vs_dir_warn}"
                             f"conf可放宽至0.62以上即可开仓，系统将自动采用试探仓控制风险。\n\n"
+                        )
+                    elif _effective_mult >= 6.0:
+                        # ── 中间级（6x~14x）：显著量能事件，提升订单流权重但不强制方向 ──
+                        _dir_threshold_lo = "35%" if _vs_bp > 0.5 else "65%"
+                        _dir_threshold_hi = "65%" if _vs_bp > 0.5 else "35%"
+                        _aggressive_ctx = (
+                            f"【⚡ 显著量能事件 VSpike={_effective_mult:.1f}x】\n"
+                            f"当前成交量为基准的{_effective_mult:.0f}倍，属于显著放量事件。\n"
+                            f"决策调整：\n"
+                            f"- 订单流/成交量动力学权重提升至60%（常规为40%）\n"
+                            f"- 静态订单簿结构（挂单墙）可靠性下降——大量能事件中挂单墙经常被吃穿\n"
+                            f"- RSI/MACD等滞后指标仍有参考价值，但不应作为主要反对理由\n"
+                            f"- 若订单流方向明确（buy_pct>{_dir_threshold_hi}看多/buy_pct<{_dir_threshold_lo}看空），"
+                            f"conf可适当放宽至0.65\n\n"
                         )
                     else:
                         _aggressive_ctx = ""
@@ -1540,59 +1566,83 @@ class ETHTrader:
                         fast_context=fast_context or "",
                         trend_alignment_score=_trend_score,
                         trend_dir=_trend_dir,
-                        vs_status=self.vspike.get_status(),
+                        vs_status=vs_frozen,
                     )
                 except Exception as ai_e:
                     log.error(f"[{symbol}] AI调用异常: {ai_e}")
                     result = {"action": "hold", "confidence": 0.0, "reason": f"AI异常: {str(ai_e)[:100]}", "thought_process": ""}
                 # 无论成功或异常，都统一在finally中释放信号量
-                with self._ai_cache_lock:
-                    self._ai_cache = result
-                    self._ai_cache_ts = time.monotonic()
-                    self._ai_hash = input_sig
-                    self._last_ai_request_time = time.monotonic()
-                    # 更新死区拦截所需的决策记录（使用开头捕获的值）
-                    self._last_ai_decision_time = time.monotonic()
-                    self._last_ai_decision_price = _saved_price_val
-                    self._last_ai_decision_rsi = _saved_rsi_val
-                    self._last_ai_decision_macd = _saved_macd_val
-                    # 宽分桶快照（用于漂移容忍判断）
-                    self._last_ai_rsi_bkt = _rsi_bkt
-                    self._last_ai_bb_zone = _bb_zone
-                    # AI 熔断器：AI 调用成功后重置失败计数
-                    self._ai_failure_count = 0
-                # Phase 1 双写过渡：同步写入 AIGatekeeper（旧变量保留，后续可清理）
-                self._ai_gate.set_cache(result, input_sig, _saved_price_val,
-                                        _saved_rsi_val, _saved_macd_val, _rsi_bkt, _bb_zone)
-                self._ai_gate.reset_failure()
+                # ── generation 检查：如果有紧急抢占请求，废弃旧结果 ──
+                if self._ai_urgent_gen > _my_gen:
+                    log.info(f"🗑️ [{symbol}] 旧AI worker(gen={_my_gen})被废弃，结果不写入缓存 (urgent_gen={self._ai_urgent_gen})")
+                    self._ai_gate.reset_failure()  # 即使废弃也重置失败计数
+                # ── 竞态检查：如果 cache clear 在自己启动之后发生 → 结果过时 ──
+                elif self._ai_gate._cache_cleared_ts > _worker_start_ts:
+                    log.info(f"🗑️ [{symbol}] 旧AI worker 结果过时（cache 在启动后被清除），丢弃")
+                    self._ai_gate.reset_failure()
+                else:
+                    with self._ai_cache_lock:
+                        self._ai_cache = result
+                        self._ai_cache_ts = time.monotonic()
+                        self._ai_hash = input_sig
+                        self._last_ai_request_time = time.monotonic()
+                        self._last_ai_decision_time = time.monotonic()
+                        self._last_ai_decision_price = _saved_price_val
+                        self._last_ai_decision_rsi = _saved_rsi_val
+                        self._last_ai_decision_macd = _saved_macd_val
+                        self._last_ai_rsi_bkt = _rsi_bkt
+                        self._last_ai_bb_zone = _bb_zone
+                        self._ai_failure_count = 0
+                        if result.get("action") in ("hold", "skip"):
+                            self._last_l1_hold_ts = time.monotonic()
+                            self._last_l1_hold_hash = input_sig
+                    # Phase 1 双写过渡：同步写入 AIGatekeeper
+                    _vs_for_cache = vs_frozen if vs_frozen else {}
+                    self._ai_gate.set_cache(result, input_sig, _saved_price_val,
+                                            _saved_rsi_val, _saved_macd_val, _rsi_bkt, _bb_zone,
+                                            vspike_mult=_vs_for_cache.get("mult", 0.0),
+                                            vspike_dir=_vs_for_cache.get("direction", ""))
+                    self._ai_gate.reset_failure()
+                    # ── AI 完成后唤醒主循环：避免等 60s 轮询间隔才读到新决策 ──
+                    try:
+                        self.vspike.spike_event.set()
+                    except Exception:
+                        pass
             except Exception as e:
                 log.error(f"[{symbol}] AI后台决策异常: {e}")
-                # 即使异常也要更新缓存，防止缓存过期导致后续决策错误
-                with self._ai_cache_lock:
-                    self._ai_cache = {
-                        "action": "hold", "confidence": 0.0,
-                        "reason": f"AI异常: {str(e)[:100]}",
-                        "thought_process": ""
-                    }
-                    self._ai_cache_ts = time.monotonic()
-                    self._ai_hash = input_sig
-                    self._last_ai_request_time = time.monotonic()
-                    # AI 熔断器：失败计数+1，连续5次则激活30分钟熔断
-                    if not _failure_counted:
-                        self._ai_failure_count += 1
-                        _failure_counted = True
-                    if self._ai_failure_count >= 5:
-                        self._ai_circuit_broken_until = time.monotonic() + 1800
-                        log.error(f"🛑 AI 连续失败{self._ai_failure_count}次，激活熔断器30分钟，降级为规则引擎")
-                        log.error(f"🛑 Telegram告警: AI 连续失败{self._ai_failure_count}次，熔断30分钟")
-                        _webhook("🛑 AI 熔断激活", f"连续{self._ai_failure_count}次失败，暂停30分钟，降级规则引擎")
-                        self._ai_failure_count = 0
+                # 竞态检查：异常路径也需检测过时结果
+                if self._ai_urgent_gen > _my_gen or self._ai_gate._cache_cleared_ts > _worker_start_ts:
+                    log.info(f"🗑️ [{symbol}] 旧AI worker 异常结果过时，丢弃（不写入缓存/不增加失败计数）")
+                    self._ai_gate.reset_failure()
+                else:
+                    # 即使异常也要更新缓存，防止缓存过期导致后续决策错误
+                    with self._ai_cache_lock:
+                        self._ai_cache = {
+                            "action": "hold", "confidence": 0.0,
+                            "reason": f"AI异常: {str(e)[:100]}",
+                            "thought_process": ""
+                        }
+                        self._ai_cache_ts = time.monotonic()
+                        self._ai_hash = input_sig
+                        self._last_ai_request_time = time.monotonic()
+                        # AI 熔断器：失败计数+1，连续5次则激活30分钟熔断
+                        if not _failure_counted:
+                            self._ai_failure_count += 1
+                            _failure_counted = True
+                        if self._ai_failure_count >= 5:
+                            self._ai_circuit_broken_until = time.monotonic() + 1800
+                            log.error(f"🛑 AI 连续失败{self._ai_failure_count}次，激活熔断器30分钟，降级为规则引擎")
+                            log.error(f"🛑 Telegram告警: AI 连续失败{self._ai_failure_count}次，熔断30分钟")
+                            _webhook("🛑 AI 熔断激活", f"连续{self._ai_failure_count}次失败，暂停30分钟，降级规则引擎")
+                            self._ai_failure_count = 0
                 # 识别429限流错误，触发专用冷却（区别于普通失败熔断）
-                _err_str = str(e).lower()
-                if "429" in _err_str or "rate limit" in _err_str or "too many requests" in _err_str:
-                    self._ai_gate.record_rate_limit(retry_after_seconds=60)
-                # Phase 1 双写过渡：同步异常状态到 AIGatekeeper
-                self._ai_gate.record_failure()
+                # 只有非过时的 worker 才记录失败
+                if self._ai_urgent_gen <= _my_gen and self._ai_gate._cache_cleared_ts <= _worker_start_ts:
+                    _err_str = str(e).lower()
+                    if "429" in _err_str or "rate limit" in _err_str or "too many requests" in _err_str:
+                        self._ai_gate.record_rate_limit(retry_after_seconds=60)
+                    # Phase 1 双写过渡：同步异常状态到 AIGatekeeper
+                    self._ai_gate.record_failure()
             finally:
                 # 修复3：统一信号量释放，确保不会漏掉或重复释放
                 if semaphore_acquired:
@@ -1612,13 +1662,19 @@ class ETHTrader:
         else:
             return CFG.cache_ttl_osc  # 默认 900s
 
-    def _get_ai_decision(self, symbol: str = None) -> Optional[Dict]:
-        return self._ai_gate.get_cached(self._market_mode)
+    def _get_ai_decision(self, symbol: str = None, atr_ratio: float = None) -> Optional[Dict]:
+        _vs = self.vspike.get_status()
+        return self._ai_gate.get_cached(
+            self._market_mode, atr_ratio=atr_ratio,
+            vspike_mult=_vs.get("mult", 0.0),
+            vspike_dir=_vs.get("direction", "")
+        )
 
-    def _clear_ai_cache(self, symbol: str = None):
-        self._ai_gate.clear()
+    def _clear_ai_cache(self, symbol: str = None, clear_last: bool = False):
+        self._ai_gate.clear(clear_last=clear_last)
         # 同步清除本地 hash，防止缓存已清除但哈希仍匹配
         self._ai_hash = ""
+
 
     def _on_trading_event(self, data: Dict):
         """EventBus 订阅者：将交易事件转发到 Telegram/日志"""
@@ -1734,6 +1790,18 @@ class ETHTrader:
                             )
                             log.info(f"📝 [{CFG.symbol}] SL/TP触发平仓记录 trade_id={current_trade_id}，"
                                      f"exit={fill_px:.4f}，原因={close_reason}")
+
+                            # ── 同步更新连亏计数（修复：止损路径绕过 _close，连亏永不更新）──
+                            with self.lock:
+                                _sl_entry = self.pos.entry_price
+                            if _sl_entry and _sl_entry > 0:
+                                _sl_side = "long" if self.pos.side == "long" else "short"
+                                _sl_pnl = (fill_px - _sl_entry) if _sl_side == "long" else (_sl_entry - fill_px)
+                                if _sl_pnl < 0:
+                                    _n = gs_increment("consecutive_losses")
+                                    log.warning(f"📉 [{CFG.symbol}] SL止损亏损，连续亏损 {_n} 次（亏损{_sl_pnl/_sl_entry*current_leverage*100:.2f}%）")
+                                else:
+                                    gs_set("consecutive_losses", 0)
                         except Exception as e:
                             log.error(f"SL/TP平仓DB记录失败 trade_id={current_trade_id}: {e}")
                         finally:
@@ -1751,9 +1819,16 @@ class ETHTrader:
                         pos  = self.pos
                         with lock:
                             if abs(float(pos_data.get("pos", 0))) > 0:
+                                self._zero_pos_seen_ts = 0.0   # 交易所确认有持仓，重置计时器
                                 pos.side        = pos_data["posSide"]
                                 pos.size        = abs(float(pos_data["pos"]))
                                 pos.entry_price = float(pos_data["avgPx"])
+                                # ── SL/TP 算法单成交检测缓存：将 pos.sl_tp_algo_ids 同步到 orders 频道可用的缓存 ──
+                                if pos.sl_tp_algo_ids:
+                                    with self._sl_tp_cache_lock:
+                                        self._sl_tp_pending_algo_ids = list(pos.sl_tp_algo_ids)
+                                        self._sl_tp_pending_leverage = pos.leverage or 1
+                                        self._sl_tp_pending_trade_id = pos.trade_id
                                 # ── 全量同步后主动更新最新一条摘要（确保健康数据反映真实持仓）──
                                 if self._ai_summaries:
                                     _last = self._ai_summaries[-1]
@@ -1766,20 +1841,28 @@ class ETHTrader:
                                         _last["pnl_pct"] = round(_sync_pnl * 100, 2)
                                         log.debug(f"🔄 [{CFG.symbol}] 同步持仓方向→{pos.side} PnL→{_sync_pnl*100:.2f}%")
                             else:
-                                # WS positions 推送 pos=0，不立即 _reset_pos()
-                                # 原因：WS 有延迟，开仓后可能收到旧的 pos=0 消息导致本地状态丢失
-                                # 安全保证：
-                                #   1. 我们的 _close() 已在平仓确认后主动 _reset_pos()
-                                #   2. 交易所强平时 orders channel 会推送强平订单
-                                #   3. REST 全量同步每 5 分钟兜底
+                                # WS positions 推送 pos=0
                                 if pos.side:
                                     _open_age = time.monotonic() - self._last_open_ts
                                     if _open_age < 30.0:
-                                        # 开仓 30s 内，静默丢弃延迟消息
+                                        # 开仓 30s 内，WS 可能返回旧快照，静默丢弃
                                         log.debug(f"WS pos=0 但本地有 {pos.side} 仓位（开仓后{_open_age:.0f}s），静默丢弃")
+                                        self._zero_pos_seen_ts = 0.0   # 重置计时器
                                     else:
-                                        log.warning(f"WS pos=0 但本地有 {pos.side} 仓位，忽略 WS 消息，等待 REST 全量同步验证")
-                                # else: 本地无持仓，忽略
+                                        # 开仓超过 30 秒，开始累积连续收到 pos=0 的时间
+                                        now_mono = time.monotonic()
+                                        if self._zero_pos_seen_ts == 0.0:
+                                            self._zero_pos_seen_ts = now_mono
+                                        elif now_mono - self._zero_pos_seen_ts > 2.0:
+                                            log.warning(
+                                                f"👻 [{sym}] WS 连续 {now_mono - self._zero_pos_seen_ts:.1f}s 返回 pos=0，"
+                                                f"但本地仍有 {pos.side} 仓位，触发强制全量同步"
+                                            )
+                                            self._zero_pos_seen_ts = 0.0   # 重置，避免重复触发
+                                            threading.Thread(target=self.state._full_state_sync, daemon=True).start()
+                                else:
+                                    # 本地无持仓，重置计时器
+                                    self._zero_pos_seen_ts = 0.0
         except Exception as e:
             log.error(f"私有 WS 消息处理异常: {e}")
 
@@ -1816,20 +1899,6 @@ class ETHTrader:
             self._mark_price_degraded = True  # 标记为降级状态
             self._mark_price_ts2 = time.monotonic()
         return fallback if fallback > 0 else mark_val
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # 策略委员会：ATR突破趋势策略 + RSI均值回归策略
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _strategy_committee(self, sym: str, ai_decision: Dict,
-                             ind_15m: Dict, ind_1h: Dict, ind_3m: Dict, current_price: float,
-                             depth: Dict = None) -> Dict:
-        """
-        策略委员会（建议模式）：AI 完全主导，委员会不修改决策。
-        仅在 >=2 个策略反对 且 AI 置信度 < 0.7 时，输出警示日志供人工关注。
-        """
-        # 策略委员会暂未实装（策略子方法待迁移），直接返回 AI 决策
-        return ai_decision
 
     def run_once(self):
         now = datetime.now(UTC)
@@ -1938,7 +2007,7 @@ class ETHTrader:
                           "黑客攻击", "FTX", "Luna", "Terra", "爆仓", "闪崩")
             _news_raw = news_data.get("text", "")
             if any(kw in _news_raw for kw in _crisis_kw):
-                self.fast_lane._clear_ai_cache()
+                self.fast_lane._clear_ai_cache(clear_last=True)
                 log.warning("🚨 检测到重大危机新闻，已强制清除 AI 缓存，确保下一轮决策立即响应")
         else:
             news_data = self.news_cache["data"]
@@ -1959,9 +2028,9 @@ class ETHTrader:
             log.debug("📊 获取当前价格用于宏观分析...")
             current_price = self._get_price(CFG.symbol)
             log.debug(f"📊 当前价格获取完成: {current_price}")
-            macro_ctx = build_macro_context(raw_daily, current_price)
-            self.macro_cache = {"data": macro_ctx, "time": now}
-        macro_context = self.macro_cache.get("data", "")
+            macro_full, macro_short = build_macro_context(raw_daily, current_price)
+            self.macro_cache = {"full": macro_full, "short": macro_short, "time": now}
+        macro_context = self.macro_cache.get("short", "")  # AI prompt 使用短版本节省 token
 
         # ── 单品种决策 ───────────────────────────────────────────────────
         log.debug("🔄 开始品种决策...")
@@ -2014,10 +2083,211 @@ class ETHTrader:
                 f"间隔{elapsed_s:.0f}s"
             )
 
+    # ============================================================
+    # 双管道 AI 调用优化：空仓决策 vs 持仓管理
+    # ============================================================
+    def _run_holding_cycle(self, sym: str, now: datetime, balance: float,
+                           price: float, pos: Position, lock,
+                           ind_15m: Dict, ind_1h: Dict, ind_4h: Dict,
+                           market_mode: str, depth: Dict, funding: Dict,
+                           raw_15m, raw_1h, raw_4h,
+                           news_data: Dict, fg_index: Dict, macro_context: str,
+                           rag_warning: str, market_sentiment: Dict,
+                           _sentiment_alert: str, key_levels: Dict,
+                           vs_status: Dict) -> None:
+        """
+        持仓管理轻量循环 —— 只做「护利」，不做「开仓」。
+
+        职责：
+          1. VSpike 反向紧急逃生窗（≥8x 反向量能 → 立即平仓）
+          2. 定期轻量 AI 持仓评估（趋势市 120s / 震荡市 240s）
+          3. 规则引擎反向信号检测（强反向信号 → 清除 AI 缓存强制重评）
+
+        风控循环（trailing 线程，每2s）已负责：
+          - 追踪止损、阶梯盈利锁、止损移动
+          → 本方法不再重复这些逻辑
+        """
+        from core import gs_set as _gs_set
+        import time as _time
+
+        _now_mono = _time.monotonic()
+
+        # ── 持仓盈亏 ────────────────────────────────────────────────────
+        pnl_pct = 0.0
+        with lock:
+            if pos.side and pos.entry_price > 0:
+                pnl_pct = (
+                    (price - pos.entry_price) / pos.entry_price if pos.side == "long"
+                    else (pos.entry_price - price) / pos.entry_price
+                )
+
+        # ── ① VSpike 反向紧急逃生窗（每轮检查，零成本）─────────────────
+        _vs_mult = vs_status.get("mult", 0.0)
+        _vs_dir = vs_status.get("direction", "均衡")
+        _vs_buy_pct = vs_status.get("buy_pct", 0.5)
+        _is_vspike = vs_status.get("is_spike", False) or vs_status.get("spike_recent", False)
+
+        if _is_vspike and _vs_mult >= 8.0 and pos.side:
+            _against = (
+                (pos.side == "short" and "买方主导" in _vs_dir) or
+                (pos.side == "long" and "卖方主导" in _vs_dir)
+            )
+            if _against:
+                _pnl_tag = f"盈利{pnl_pct*100:.2f}%" if pnl_pct > 0 else (
+                    f"保本区({pnl_pct*100:.2f}%)" if pnl_pct > -0.003 else f"亏损{pnl_pct*100:.1f}%"
+                )
+                log.critical(
+                    f"💥 [{sym}] [持仓逃生窗] VSpike {_vs_mult:.1f}x 反向{_vs_dir} "
+                    f"(buy={_vs_buy_pct:.0%}) + {_pnl_tag} → 紧急平仓"
+                )
+                log_event("holding_vspike_escape", {
+                    "sym": sym, "side": pos.side, "pnl_pct": pnl_pct,
+                    "vspike_mult": _vs_mult, "vspike_dir": _vs_dir,
+                })
+                self._ai_close_pending_until = _now_mono + 5.0
+                self.position_exec._close(
+                    f"VSpike逃生窗: {_vs_mult:.1f}x反向{_vs_dir} ({_pnl_tag})",
+                    symbol=sym
+                )
+                # 清除 AI 缓存，防止缓存决策干扰
+                self.fast_lane._clear_ai_cache(symbol=sym)
+                _gs_set("last_holding_adjust_ts", _now_mono)
+                return
+
+        # ── ② 规则引擎反向信号检测 ──────────────────────────────────────
+        if pos.side:
+            _hold_rule = self.signals.evaluate_rules(
+                ind_15m, price, self._prev_indicators.get(sym),
+                market_mode, key_levels, depth,
+                vs_status=vs_status
+            )
+            _hold_counter = (
+                (_hold_rule.get("signal_type") == "short" and pos.side == "long") or
+                (_hold_rule.get("signal_type") == "long" and pos.side == "short")
+            )
+            _hold_conf = _hold_rule.get("confidence", 0.0)
+            if _hold_counter and _hold_conf >= CFG.close_confidence_threshold:
+                log.warning(
+                    f"⚠️ [{sym}] 规则引擎反向信号(conf={_hold_conf:.2f})与当前持仓{pos.side}相反，"
+                    f"清除AI缓存强制重评 | {_hold_rule.get('reason', '')}"
+                )
+                self.fast_lane._clear_ai_cache(symbol=sym)
+
+        # ── ③ 定期轻量 AI 持仓评估 ──────────────────────────────────────
+        # 动态间隔：趋势市 120s / 震荡市 240s / VSpike 突增 → 立即评估
+        _base_interval = 120.0 if market_mode == "趋势" else 240.0
+
+        # VSpike ≥5x → 缩短间隔，加快响应
+        if _vs_mult >= 10.0:
+            _eff_interval = 25.0
+        elif _vs_mult >= 5.0:
+            _eff_interval = 40.0
+        else:
+            _eff_interval = _base_interval
+
+        _last_adj = getattr(self, "_last_holding_adjust_ts", 0.0)
+        _age = _now_mono - _last_adj if _last_adj > 0 else 999.0
+
+        if _age < _eff_interval:
+            # 间隔未到 → 跳过 AI 调用，仅做内存检查
+            _remaining = _eff_interval - _age
+            if self._should_log(f"hold_skip_{sym}", 60.0):
+                log.debug(
+                    f"⏳ [{sym}] [持仓循环] 距下次AI评估还有 {_remaining:.0f}s "
+                    f"(interval={_eff_interval:.0f}s, mode={market_mode})，跳过"
+                )
+            return
+
+        # ── AI 持仓评估 ─────────────────────────────────────────────────
+        # 构造精简 prompt（只做持仓管理，不需要开仓相关上下文）
+        pos_info = {
+            "side":            pos.side,
+            "entry_price":     pos.entry_price,
+            "pnl_pct":         pnl_pct,
+            "holding_minutes": (now - pos.open_time).total_seconds() / 60 if pos.open_time else 0,
+            "peak_price":      pos.peak_price,
+            "current_sl":      pos.stop_loss,
+            "current_tp":      pos.take_profit,
+        }
+
+        # 构建精简的持仓管理 prompt
+        _holding_prompt = (
+            f"【持仓管理评估】\n"
+            f"当前{pos.side}仓 | 入场价={pos.entry_price:.2f} | 现价={price:.2f}\n"
+            f"浮盈/亏={pnl_pct*100:+.2f}% | 持仓{pos_info['holding_minutes']:.1f}分钟\n"
+            f"止损={pos.stop_loss:.2f} | 止盈={pos.take_profit:.2f} | 峰值={pos.peak_price:.2f}\n"
+            f"RSI={ind_15m.get('rsi', 50):.1f} | BB%={ind_15m.get('bb_pct', 0.5):.2f} | "
+            f"ATR={ind_15m.get('atr', 0):.2f} | 量能突增={ind_15m.get('vol_surge', 1.0):.1f}x\n"
+            f"市场模式={market_mode} | 盘口失衡={depth.get('imbalance', 0):+.3f}\n"
+            f"VSpike: {_vs_mult:.1f}x {_vs_dir} (buy={_vs_buy_pct:.0%})\n"
+            f"请评估是否应该：close（平仓）、hold（继续持有）、adjust_sl_tp（调整止损止盈）\n"
+            f"输出JSON: " + '{{"action":"close|hold|adjust_sl_tp","confidence":0.0~1.0,"reason":"一句话","suggested_sl":数值或null,"suggested_tp":数值或null}}'
+        )
+
+        _sys_prompt = (
+            "你是ETH-USDT-SWAP量化交易的持仓管理专家。"
+            "当前已有持仓，你的任务是评估是否应该平仓、继续持有或调整止损止盈。"
+            "只输出JSON，不输出任何其他内容。"
+            "\n\n【持仓管理原则】"
+            "\n1. VSpike≥8x反向量能 → 立即close"
+            "\n2. 浮盈>1%但微观转坏(VSpike反向、RSI极端) → close锁定利润"
+            "\n3. 浮亏>0.5%且无恢复信号 → close止损"
+            "\n4. 趋势持续且微观支持 → hold"
+            "\n5. 止损必给：adjust_sl_tp必须同时给suggested_sl和suggested_tp"
+        )
+
+        try:
+            _hold_decision = self.ai._fast_ai_direction_check(
+                simple_prompt=_holding_prompt,
+                allowed_actions=["close", "hold", "adjust_sl_tp"],
+                system_prompt=_sys_prompt,
+            )
+        except Exception as e:
+            log.warning(f"⚠️ [{sym}] 持仓AI评估异常: {e}，跳过本轮")
+            _gs_set("last_holding_adjust_ts", _now_mono)
+            return
+
+        _hd_action = _hold_decision.get("action", "hold")
+        _hd_conf = _hold_decision.get("confidence", 0.0)
+        _hd_reason = _hold_decision.get("reason", "")[:100]
+
+        # 更新持仓调整时间戳
+        _gs_set("last_holding_adjust_ts", _now_mono)
+        self._last_holding_adjust_ts = _now_mono
+
+        log.info(
+            f"📋 [{sym}] [持仓AI评估] {_hd_action} conf={_hd_conf:.2f} | {_hd_reason}"
+        )
+
+        # ── 执行决策 ────────────────────────────────────────────────────
+        if _hd_action == "close" and _hd_conf >= 0.65:
+            log.info(
+                f"🔻 [{sym}] [持仓AI平仓] conf={_hd_conf:.2f} | {_hd_reason}"
+            )
+            self._ai_close_pending_until = _now_mono + 5.0
+            self.position_exec._close(f"持仓管理平仓: {_hd_reason}", symbol=sym)
+            return
+
+        if _hd_action == "adjust_sl_tp" and _hd_conf >= 0.65:
+            new_sl = _hold_decision.get("suggested_sl")
+            new_tp = _hold_decision.get("suggested_tp")
+            if new_sl and new_tp and new_sl > 0 and new_tp > 0:
+                self.position_exec._adjust_sl_tp(new_sl, new_tp, _hd_reason, symbol=sym)
+            return
+
+        # hold → 静默
+        if self._should_log(f"hold_ai_{sym}", 120.0):
+            log.debug(
+                f"😶 [{sym}] [持仓AI评估] hold conf={_hd_conf:.2f} | {_hd_reason}"
+            )
+
     def _run_symbol(self, sym: str, now: datetime, balance: float,
                     news_data: Dict, fg_index: Dict, macro_context: str):
         """单品种决策：获取数据 → AI触发 → 执行动作"""
         log.debug(f"🔄 [{sym}] _run_symbol 开始")
+        # ── 初始化规则引擎相关状态（防止极端竞态）────────────────────────
+        fast_decision = None
+        rule_result = None
         pos  = self.pos
         lock = self.lock
 
@@ -2097,6 +2367,14 @@ class ETHTrader:
             log.warning(f"⚠️ [{sym}] 15m K线不可用，跳过本轮")
             return
 
+        # ── Hurst 指数用：计算近30根15m收益率序列（用于 Regime 复合化评分）───
+        if raw_15m and len(raw_15m) >= 31:
+            _close_prices = np.array([float(c[4]) for c in raw_15m[-31:]], dtype=float)
+            returns_30 = np.diff(np.log(_close_prices))
+            self._returns_cache[sym] = returns_30
+        else:
+            returns_30 = self._returns_cache.get(sym)
+
         # 策略委员会用：存储原始K线供ATR突破和RSI策略使用
         self._last_15m_raw = raw_15m
         self._last_3m_raw  = raw_3m
@@ -2119,7 +2397,16 @@ class ETHTrader:
             if ind_15m.get("_valid"):
                 self._ind_15m_cache = (_now, ind_15m, _raw_hash)
         ind_1h  = calc_indicators(raw_1h)
-        ind_4h  = calc_indicators(raw_4h)
+
+        # P1: 4H指标600s TTL缓存（4H K-line每4小时才变一根，避免每tick重复计算）
+        _raw_4h_hash = str(raw_4h[-1][0]) if raw_4h else ""
+        _cached_4h_ts, _cached_4h_ind, _cached_4h_hash = self._ind_4h_cache
+        if raw_4h and (_now - _cached_4h_ts < 600.0 and _cached_4h_ind.get("_valid") and _raw_4h_hash == _cached_4h_hash):
+            ind_4h = _cached_4h_ind
+        else:
+            ind_4h = calc_indicators(raw_4h) if raw_4h else {"_valid": False}
+            if ind_4h.get("_valid"):
+                self._ind_4h_cache = (_now, ind_4h, _raw_4h_hash)
 
         # 激进优化：3m 指标（独立缓存，快速捕捉突破信号）
         _raw_3m_hash = str(raw_3m[-1][0]) if raw_3m else ""
@@ -2149,20 +2436,6 @@ class ETHTrader:
             log.warning(f"⚠️ [{sym}] 15m K线无效，跳过")
             return
 
-        # ── close拦截冷却解封检查（价格偏移 > 0.5×ATR → 行情已变化，提前解封）────
-        _bctx = self._blocked_close_ctx.get(sym)
-        if _bctx and time.monotonic() < _bctx.get("blocked_until", 0):
-            _blk_price = _bctx.get("block_price", 0)
-            _blk_atr   = _bctx.get("atr", 0)
-            if _blk_price > 0 and _blk_atr > 0:
-                _price_shift = abs(price - _blk_price)
-                if _price_shift >= _blk_atr * 0.5:
-                    log.info(
-                        f"🔓 [{sym}] 价格偏移{_price_shift:.2f}≥0.5×ATR({_blk_atr:.2f})，"
-                        f"close拦截冷却提前解封（拦截价={_blk_price:.2f} 当前={price:.2f}）"
-                    )
-                    self._blocked_close_ctx.pop(sym, None)
-
         depth   = self.trader.analyze_orderbook()
 
         # ── 订单簿滚动均值基准（用于动态冰山墙判断）──────────────────────────
@@ -2183,7 +2456,7 @@ class ETHTrader:
             self.funding_cache = {"data": funding, "time": now}
             fh = self.funding_history
             fh.append({"funding_rate": funding.get("funding_rate", 0)})
-            if len(fh) > 12:
+            if len(fh) > 32:
                 self.funding_history = fh[-12:]
         else:
             funding = fc["data"]
@@ -2194,6 +2467,18 @@ class ETHTrader:
             depth, funding
         )
         _signal.price = price
+
+        # ── 信号纯度评分（Signal Purity Score）────────────────────────────
+        # 多维度确定性评估 0~1，过滤低质量信号，防止 AI 被矛盾输入干扰
+        # 空仓时用于决定 entry_cooldown 是否延长；持仓时仅记录供复盘
+        _vs = self.vspike.get_status()
+        _purity = _calc_signal_purity(ind_15m, ind_1h, ind_4h, _vs, depth, funding)
+        gs_set("signal_purity", round(_purity, 3))
+        # 中低纯度提示（节流日志）
+        if _purity < 0.55 and self._should_log(f"purity_low_{sym}", 300.0):
+            log.debug(f"📉 [{sym}] 信号纯度低: {_purity:.2f}（多指标矛盾）")
+        elif _purity < 0.70 and self._should_log(f"purity_mid_{sym}", 300.0):
+            log.debug(f"📊 [{sym}] 信号纯度中等: {_purity:.2f}（部分分歧）")
 
         # L3 关键价位（每品种，4H刷新）
         klc = self.key_levels_cache
@@ -2258,9 +2543,9 @@ class ETHTrader:
             oi_ch = msd.get("oi_change_pct")
             # 多空比极值反转
             if ls is not None:
-                if ls > 2.0 and price > ind_1h.get('ema_20', price) * 1.02:
+                if ls > 2.0 and price > ind_1h.get('ema21', price) * 1.02:
                     _sentiment_alert += "⚠️多空比极值(>2.0)+价格高位→强烈抑制做多，可寻找做空机会 "
-                elif ls < 0.5 and price < ind_1h.get('ema_20', price) * 0.98:
+                elif ls < 0.5 and price < ind_1h.get('ema21', price) * 0.98:
                     _sentiment_alert += "⚠️多空比极值(<0.5)+价格低位→强烈抑制做空，可寻找做多机会 "
                 # 多空比快速回归（情绪退潮）
                 prev_ls = self._prev_ls_ratio
@@ -2314,405 +2599,101 @@ class ETHTrader:
         log.debug(f"😱 [{sym}] 恐贪={fg_index['value']} 费率={funding['funding_rate']*100:.4f}% 失衡={depth['imbalance']:.3f}")  # 主循环每轮输出，改为DEBUG减少刷屏
 
         # ── 市场模式（在所有使用点之前计算，供规则引擎/打板检测/逆势开仓等共用）──
-        _osc_market = (
-            get_market_mode(ind_15m, price, self._market_mode)
-            if (ind_15m and ind_15m.get("_valid"))
-            else (self._market_mode or "趋势")
-        )
-        self._market_mode = _osc_market  # 缓存供本轮所有逻辑及追踪止损使用
-        self.vspike.market_mode = _osc_market  # 同步给检测器，用于自适应阈值
-
-        # ── 1.1 规则引擎预筛选（仅在空仓时执行）──────────────────────────────
-        # 规则引擎快速评估布林带、RSI、成交量等确定性信号
-        # 明确信号（如RSI超买超卖）直接给出决策，无需触发AI
-        # 修复5：统一信号判断优先级，规则引擎信号纳入fast_decision统一管理
-        fast_decision = None  # 统一快速决策信号初始为空
-        if not pos.side:
-            rule_result = self.signals.evaluate_rules(
-                ind_15m, price,
-                prev_indicators=self._prev_indicators,
-                market_mode=_osc_market,
-                key_levels=key_levels,
+        # 返回 (categorical_mode, regime_score)，regime_score 注入 ind_15m 供后续规则引擎使用
+        if ind_15m and ind_15m.get("_valid"):
+            market_mode, _regime_score = get_market_mode(
+                ind_15m, price, self._market_mode,
+                funding=funding, returns_30=returns_30
             )
-            self._prev_indicators = {"rsi": ind_15m.get("rsi"), "vol_surge": ind_15m.get("vol_surge")}
-            if not rule_result["trigger_ai"] and rule_result["signal_type"] in ("long", "short"):
-                action = f"open_{rule_result['signal_type']}"
-                rule_conf = rule_result["confidence"]
-                # 获取VSpike状态，用于防抖逃生窗
-                _vs4debow = self.vspike.get_status()
-                _spike_bypass = _vs4debow.get("spike_just_triggered", False)
-                if self.fast_lane._is_redundant_fast_signal(sym, "RULE_RSI", action, rule_conf,
-                                                  cooldown=300, force_bypass=_spike_bypass):
-                    pass  # 防抖命中，不生成新的 fast_decision，跳到AI推理路径
-                else:
-                    # ── 拒绝反馈：被 ConvictionScore 连续拒绝的信号进入冷却 ──
-                    _rej_key = f"{sym}_{action}"
-                    _prev_rej = self._fast_rejection_cache.get(_rej_key)
-                    _rej_suppressed = False
-                    if _prev_rej:
-                        _rej_act, _rej_cnt, _rej_ts = _prev_rej
-                        _rej_age = time.monotonic() - _rej_ts
-                        if _rej_age >= 600:  # 10 min 过期自动清除
-                            self._fast_rejection_cache.pop(_rej_key, None)
-                        elif _rej_cnt >= 2 and not (_spike_bypass and _vs4debow.get("mult", 0) >= 6.0):
-                            log.info(
-                                f"🛡️ [{sym}] 规则引擎信号抑制: {action} 已被ConvictionScore"
-                                f"连续{_rej_cnt}次拒绝，冷却剩余{600 - _rej_age:.0f}s"
-                            )
-                            _rej_suppressed = True
-                    if not _rej_suppressed:
-                        # ── 分模式硬过滤 ──
-                        _vol_rule = ind_15m.get("vol_surge", 0)
-                        _ob_rule  = depth.get("imbalance", 0)
-                        _adx_rule = ind_15m.get("adx", 0)
-                        _is_long_rule = (action == "open_long")
-                        if _osc_market == "趋势":
-                            _vol_pass = _vol_rule >= 1.4
-                            _ob_pass  = (_is_long_rule and _ob_rule > 0.25) or (not _is_long_rule and _ob_rule < -0.25)
-                            _adx_pass = _adx_rule >= 22
-                            _ok_rule = _vol_pass and _ob_pass and _adx_pass
-                            _why_fail = []
-                            if not _vol_pass: _why_fail.append(f"vol={_vol_rule:.1f}x<1.4")
-                            if not _ob_pass:  _why_fail.append(f"imb={_ob_rule:+.3f}")
-                            if not _adx_pass: _why_fail.append(f"adx={_adx_rule:.1f}<22")
-                        else:  # 震荡 / 震荡激进
-                            _vol_pass = _vol_rule >= 1.2
-                            _ob_pass  = (_is_long_rule and _ob_rule > 0.20) or (not _is_long_rule and _ob_rule < -0.20)
-                            _ok_rule = _vol_pass and _ob_pass
-                            _why_fail = []
-                            if not _vol_pass: _why_fail.append(f"vol={_vol_rule:.1f}x<1.2")
-                            if not _ob_pass:  _why_fail.append(f"imb={_ob_rule:+.3f}")
-                        if not _ok_rule:
-                            log.debug(f"🔇 [{sym}] 规则引擎信号被分模式过滤拦截({', '.join(_why_fail)})，降级为AI推理")
-                        else:
-                            _spike_tag = "  🔥波动唤醒" if _spike_bypass else ""
-                            # 置信度封顶：规则引擎信号最高 0.72，强制 AI 最终把关
-                            _capped_conf = min(rule_conf, 0.72)
-                            if _capped_conf < rule_conf and not _spike_bypass:
-                                log.debug(f"📎 [{sym}] 规则引擎置信度封顶: {rule_conf:.2f}→{_capped_conf:.2f}")
-                            log.info(f"📋 [{sym}] 规则引擎预筛选{_spike_tag}: {rule_result['reason']}，置信度={_capped_conf:.2f}，直接{action}")
-                            fast_decision = {
-                                "action": action,
-                                "confidence": _capped_conf,
-                                "suggested_sl": 0,
-                                "suggested_tp": 0,
-                                "suggested_leverage": min(CFG.max_leverage, 5),
-                                "reason": rule_result["reason"],
-                                "thought_process": f"[规则引擎] {rule_result['reason']}"
-                            }
-                # 规则引擎信号优先级最高，不执行后续快速决策（ breakout/MA/MACD）
+            ind_15m["regime_score"] = _regime_score
+        else:
+            market_mode = self._market_mode or "趋势"
+        self._market_mode = market_mode  # 缓存供本轮所有逻辑及追踪止损使用
+        self.vspike.market_mode = market_mode  # 同步给检测器，用于自适应阈值
 
-        # 静默拦截：持仓时若市场无明显变化且未超过静默期，则跳过AI请求
+        # ═══════════════════════════════════════════════════════════════════
+        # 双管道分流：空仓决策 vs 持仓管理
+        # ═══════════════════════════════════════════════════════════════════
+        if pos.side:
+            # 持仓管理：轻量循环（VSpike逃生 + 定期AI评估 + 规则反向检测）
+            # 风控线程（trailing）已负责：追踪止损、阶梯盈利锁
+            self._run_holding_cycle(
+                sym, now, balance, price, pos, lock,
+                ind_15m, ind_1h, ind_4h, market_mode, depth, funding,
+                raw_15m, raw_1h, raw_4h,
+                news_data, fg_index, macro_context,
+                rag_warning, market_sentiment, _sentiment_alert, key_levels,
+                vs_status=self.vspike.get_status(),
+            )
+            return
+
+        # ── 空仓决策：完整管线（规则引擎 + 打板 + MA/MACD + 震荡信号 + AI）──
+        # 日风险用满 → 跳过规则引擎 + AI 调用，避免无谓消耗
+        # ── 1.1 规则引擎预筛选 + 核心覆盖修复 ─────────────────────────────
+        _today_risk = float(gs_get("today_opened_risk", 0.0))
+        _eq = self.latest_equity if self.latest_equity > 0 else balance
+        if _today_risk > 0 and _today_risk >= _eq * CFG.max_daily_risk_pct:
+            if self._should_log("daily_risk_full", 300.0):
+                log.info(f"🛑 [{sym}] 日风险已用满({_today_risk:.2f}U/{_eq*CFG.max_daily_risk_pct:.2f}U)，跳过规则引擎+AI调用，等待下轮重置")
+            return
+        rule_result = self.signals.evaluate_rules(
+            ind_15m, price, self._prev_indicators.get(sym),
+            market_mode, key_levels, depth,
+            vs_status=self.vspike.get_status()
+        )
+        self._prev_indicators = {"rsi": ind_15m.get("rsi"), "vol_surge": ind_15m.get("vol_surge")}
+
+        # ── 规则引擎：仅作为信号收集器，注入 prompt 供 AI 参考，不再直出 ──
+        if rule_result.get("signal_type") in ("long", "short"):
+            _rs = rule_result.get("signal_type")
+            _rc = rule_result.get("confidence", 0)
+            _rr = rule_result.get("reason", "")
+            log.debug(f"📋 [{sym}] 规则引擎信号: {_rs} (conf={_rc:.2f}) — 注入 prompt 供 AI 参考")
+
+
+        # ── 请求拦截检查（静默已禁用，仅保留熔断/VSpike 冷却/EAT 检测）───
         silence_triggered = False
-        if self.fast_lane._should_skip_ai_request(sym, ind_15m, ind_1h, price):
-            log.debug(f"⏸️ [{sym}] 静默拦截：持仓无显著变化，跳过AI请求，使用缓存决策")
-            decision = self.fast_lane._get_ai_decision(symbol=sym)
-            if decision is None:
-                decision = {"action": "hold", "confidence": 0.5, "reason": "静默拦截", "thought_process": ""}
+        if fast_decision is None and self.fast_lane._should_skip_ai_request(sym, ind_15m, ind_1h, price):
+            log.debug(f"⏸️ [{sym}] AI 请求被拦截（熔断/冷却），使用缓存决策")
+            decision = self._safe_ai_decision(sym, ind_15m, "请求拦截")
             silence_triggered = True
-            # 静默拦截时，直接进入后续动作判断，跳过 AI 触发
 
-        # ── 1.2 打板检测（快速决策通道）──────────────────────────────────────
-        # 若检测到强势突破且当前空仓，优先使用快速决策（绕过AI等待）
-        # 修复5：仅当规则引擎未给出信号时才进行打板检测
-        # 传入 ind_15m 和 market_mode 使 ADX/震荡激进过滤生效
-        if not pos.side and not silence_triggered and fast_decision is None:
-            # 检测向上突破
-            breakout_up = self.signals._detect_breakout(raw_15m, price, direction="long", ind_15m=ind_15m, market_mode=_osc_market)
-            breakout_down = self.signals._detect_breakout(raw_15m, price, direction="short", ind_15m=ind_15m, market_mode=_osc_market)
-            # 优先处理有明显方向的突破（冷却：趋势市5min，震荡市10min）
-            _bo_cooldown = 600 if _osc_market != "趋势" else 300
-            _now_mono = time.monotonic()
-            # 分模式硬过滤（突破属于趋势信号，需要 ADX 确认）
-            _adx_bo = ind_15m.get("adx", 0)
-            if _osc_market == "趋势":
-                _adx_bo_ok = _adx_bo >= 22
-                _vol_bo_min = 1.4
-                _ob_bo_min = 0.25
-            else:  # 震荡 / 震荡激进
-                _adx_bo_ok = True  # 震荡市不要求 ADX
-                _vol_bo_min = 1.2
-                _ob_bo_min = 0.20
-            if breakout_up.get("breakout") and breakout_up.get("confidence", 0) >= 0.6:
-                _vol_bo_up = ind_15m.get("vol_surge", 0)
-                _ob_bo_up  = depth.get("imbalance", 0)
-                _bo_up_ok = _vol_bo_up >= _vol_bo_min and _ob_bo_up > _ob_bo_min and _adx_bo_ok
-                if _bo_up_ok and _now_mono - self._last_breakout_ts["up"] >= _bo_cooldown:
-                    self._last_breakout_ts["up"] = _now_mono
-                    self._consecutive_hold = 0       # 突破信号唤醒，重置冷静期
-                    self._ai_hold_wait = 0
-                    if not self.fast_lane._is_redundant_fast_signal(sym, "BREAKOUT_UP", "open_long", breakout_up["confidence"]):
-                        log.warning(f"🚀 [{sym}] 打板信号：{breakout_up.get('reason')}，置信度={breakout_up.get('confidence'):.2f}，使用快速开多")
-                        fast_decision = {
-                            "action": "open_long",
-                            "confidence": breakout_up["confidence"],
-                            "suggested_sl": breakout_up.get("sl", price - breakout_up.get("atr", 20) * 1.5),
-                            "suggested_tp": 0,
-                            "suggested_leverage": min(CFG.max_leverage, 8),
-                            "reason": breakout_up["reason"],
-                            "thought_process": f"[打板快速决策] {breakout_up['reason']}"
-                        }
-                elif not _bo_up_ok:
-                    _why_fail = []
-                    if _vol_bo_up < _vol_bo_min: _why_fail.append(f"vol={_vol_bo_up:.1f}x")
-                    if _ob_bo_up <= _ob_bo_min:  _why_fail.append(f"imb={_ob_bo_up:+.3f}")
-                    if not _adx_bo_ok:           _why_fail.append(f"adx={_adx_bo:.1f}")
-                    log.debug(f"🔇 [{sym}] 打板多头信号被分模式过滤拦截({', '.join(_why_fail)})，降级为AI推理")
-                else:
-                    log.debug(f"⏳ [{sym}] 打板多头信号冷却中（距上次 {_now_mono - self._last_breakout_ts['up']:.0f}s < {_bo_cooldown}s），跳过")
-            elif breakout_down.get("breakout") and breakout_down.get("confidence", 0) >= 0.6:
-                _vol_bo_dn = ind_15m.get("vol_surge", 0)
-                _ob_bo_dn  = depth.get("imbalance", 0)
-                _bo_dn_ok = _vol_bo_dn >= _vol_bo_min and _ob_bo_dn < -_ob_bo_min and _adx_bo_ok
-                if _bo_dn_ok and _now_mono - self._last_breakout_ts["down"] >= _bo_cooldown:
-                    self._last_breakout_ts["down"] = _now_mono
-                    self._consecutive_hold = 0       # 突破信号唤醒，重置冷静期
-                    self._ai_hold_wait = 0
-                    if not self.fast_lane._is_redundant_fast_signal(sym, "BREAKOUT_DOWN", "open_short", breakout_down["confidence"]):
-                        log.warning(f"🚀 [{sym}] 打板信号：{breakout_down.get('reason')}，置信度={breakout_down.get('confidence'):.2f}，使用快速开空")
-                        fast_decision = {
-                            "action": "open_short",
-                            "confidence": breakout_down["confidence"],
-                            "suggested_sl": breakout_down.get("sl", price + breakout_down.get("atr", 20) * 1.5),
-                            "suggested_tp": 0,
-                            "suggested_leverage": min(CFG.max_leverage, 8),
-                            "reason": breakout_down["reason"],
-                            "thought_process": f"[打板快速决策] {breakout_down['reason']}"
-                        }
-                elif not _bo_dn_ok:
-                    _why_fail = []
-                    if _vol_bo_dn < _vol_bo_min: _why_fail.append(f"vol={_vol_bo_dn:.1f}x")
-                    if _ob_bo_dn >= -_ob_bo_min: _why_fail.append(f"imb={_ob_bo_dn:+.3f}")
-                    if not _adx_bo_ok:           _why_fail.append(f"adx={_adx_bo:.1f}")
-                    log.debug(f"🔇 [{sym}] 打板空头信号被分模式过滤拦截({', '.join(_why_fail)})，降级为AI推理")
-                else:
-                    log.debug(f"⏳ [{sym}] 打板空头信号冷却中（距上次 {_now_mono - self._last_breakout_ts['down']:.0f}s < {_bo_cooldown}s），跳过")
-
-        # ── 1.3 新增强快速决策信号（MA交叉 + MACD交叉）──────────────────────
-        # MA5/MA10 黄金交叉 + 放量 → 快速做多
-        # MACD柱状线从负转正 + 放量 → 快速做多
-        if not pos.side and not silence_triggered and fast_decision is None:
-            closes_for_ma = [float(k[4]) for k in raw_15m[-10:]]
-            if len(closes_for_ma) >= 10:
-                # pandas已在文件顶部全局导入，无需重复导入
-                ma5_series = pd.Series(closes_for_ma).ewm(span=5, adjust=False)
-                ma10_series = pd.Series(closes_for_ma).ewm(span=10, adjust=False)
-                ma5_curr = float(ma5_series.mean().iloc[-1])
-                ma10_curr = float(ma10_series.mean().iloc[-1])
-                ma5_prev = float(ma5_series.mean().iloc[-2])
-                ma10_prev = float(ma10_series.mean().iloc[-2])
-
-                # MA黄金交叉：MA5从下方穿越MA10
-                ma_golden_cross = (ma5_curr > ma10_curr) and (ma5_prev <= ma10_prev)
-                # MA死叉：MA5从上方穿越MA10
-                ma_death_cross = (ma5_curr < ma10_curr) and (ma5_prev >= ma10_prev)
-
-                # 获取已计算的指标
-                macd_cross_up = ind_15m.get("macd_cross_up", False)
-                macd_cross_dn = ind_15m.get("macd_cross_down", False)
-                vol_surge = ind_15m.get("vol_surge", 1.0)
-                atr = ind_15m.get("atr", 20)
-
-                # 分模式硬过滤（MA/MACD属于趋势信号，趋势市需要 ADX 确认）
-                _adx_ma = ind_15m.get("adx", 0)
-                _ma_adx_ok = _osc_market == "趋势" and _adx_ma < 22  # 趋势市ADX不足时拦截
-                # ── OB盘口方向对齐（4个子信号共用）──
-                _ob_ma = depth.get("imbalance", 0)
-                # MA黄金交叉 + 强放量(>=1.8) → 快速做多
-                # 门槛高于MACD：MA5/MA10在15m上噪音大，需更强放量确认
-                if ma_golden_cross and vol_surge >= 1.8:
-                    if _ma_adx_ok:
-                        log.debug(f"🔇 [{sym}] MA黄金交叉被ADX过滤拦截(adx={_adx_ma:.1f}<22, market={_osc_market})，降级为AI推理")
-                    elif _ob_ma <= 0.20:
-                        log.debug(f"🔇 [{sym}] MA黄金交叉被OB盘口过滤拦截(imb={_ob_ma:+.3f}≤0.20)，降级为AI推理")
-                    elif not self.fast_lane._is_redundant_fast_signal(sym, "MA_GOLDEN", "open_long", 0.65):
-                        log.warning(f"🚀 [{sym}] MA黄金交叉+放量信号，使用快速开多")
-                        fast_decision = {
-                            "action": "open_long",
-                            "confidence": 0.65,
-                            "suggested_sl": ma10_curr - atr * 1.5,
-                            "suggested_tp": 0,
-                            "suggested_leverage": min(CFG.max_leverage, 8),
-                            "reason": f"MA5/MA10黄金交叉+放量{vol_surge:.1f}倍",
-                            "thought_process": f"[MA黄金交叉快速决策] MA5={ma5_curr:.2f} MA10={ma10_curr:.2f}"
-                        }
-                # MACD柱状线从负转正 + 放量(>=1.3) → 快速做多（MACD已平滑，门槛低于MA交叉）
-                elif macd_cross_up and vol_surge >= 1.3:
-                    if _ma_adx_ok:
-                        log.debug(f"🔇 [{sym}] MACD金叉被ADX过滤拦截(adx={_adx_ma:.1f}<22, market={_osc_market})，降级为AI推理")
-                    elif _ob_ma <= 0.20:
-                        log.debug(f"🔇 [{sym}] MACD金叉被OB盘口过滤拦截(imb={_ob_ma:+.3f}≤0.20)，降级为AI推理")
-                    elif not self.fast_lane._is_redundant_fast_signal(sym, "MACD_GOLDEN", "open_long", 0.68):
-                        log.warning(f"🚀 [{sym}] MACD金叉+放量信号，使用快速开多")
-                        fast_decision = {
-                            "action": "open_long",
-                            "confidence": 0.68,
-                            "suggested_sl": price - atr * 1.5,
-                            "suggested_tp": 0,
-                            "suggested_leverage": min(CFG.max_leverage, 8),
-                            "reason": f"MACD金叉+放量{vol_surge:.1f}倍",
-                            "thought_process": "[MACD金叉快速决策]"
-                        }
-                # MA死叉 + 强放量(>=1.8) → 快速做空
-                elif ma_death_cross and vol_surge >= 1.8:
-                    if _ma_adx_ok:
-                        log.debug(f"🔇 [{sym}] MA死叉被ADX过滤拦截(adx={_adx_ma:.1f}<22, market={_osc_market})，降级为AI推理")
-                    elif _ob_ma >= -0.20:
-                        log.debug(f"🔇 [{sym}] MA死叉被OB盘口过滤拦截(imb={_ob_ma:+.3f}≥-0.20)，降级为AI推理")
-                    elif not self.fast_lane._is_redundant_fast_signal(sym, "MA_DEATH", "open_short", 0.65):
-                        log.warning(f"🚀 [{sym}] MA死叉+放量信号，使用快速开空")
-                        fast_decision = {
-                            "action": "open_short",
-                            "confidence": 0.65,
-                            "suggested_sl": ma10_curr + atr * 1.5,
-                            "suggested_tp": 0,
-                            "suggested_leverage": min(CFG.max_leverage, 8),
-                            "reason": f"MA5/MA10死叉+放量{vol_surge:.1f}倍",
-                            "thought_process": f"[MA死叉快速决策] MA5={ma5_curr:.2f} MA10={ma10_curr:.2f}"
-                        }
-                # MACD柱状线从正转负 + 放量(>=1.3) → 快速做空
-                elif macd_cross_dn and vol_surge >= 1.3:
-                    if _ma_adx_ok:
-                        log.debug(f"🔇 [{sym}] MACD死叉被ADX过滤拦截(adx={_adx_ma:.1f}<22, market={_osc_market})，降级为AI推理")
-                    elif _ob_ma >= -0.20:
-                        log.debug(f"🔇 [{sym}] MACD死叉被OB盘口过滤拦截(imb={_ob_ma:+.3f}≥-0.20)，降级为AI推理")
-                    elif not self.fast_lane._is_redundant_fast_signal(sym, "MACD_DEATH", "open_short", 0.68):
-                        log.warning(f"🚀 [{sym}] MACD死叉+放量信号，使用快速开空")
-                        fast_decision = {
-                            "action": "open_short",
-                            "confidence": 0.68,
-                            "suggested_sl": price + atr * 1.5,
-                            "suggested_tp": 0,
-                            "suggested_leverage": min(CFG.max_leverage, 8),
-                            "reason": f"MACD死叉+放量{vol_surge:.1f}倍",
-                            "thought_process": "[MACD死叉快速决策]"
-                        }
-
-        # ── 1.4a 震荡市专用评分函数（快速决策通道）──────────────────────────
-        # 注：_osc_market 已在 1.2 之前统一计算，此处直接复用
-        # 当市场为震荡市且空仓时，基于RSI+关键位+成交量直接开仓，无需等待AI
-        if not pos.side and _osc_market == "震荡" and not silence_triggered and fast_decision is None:
-            rsi = ind_15m.get("rsi", 50)
-            price_now = price
-            supports = key_levels.get("supports", []) if key_levels else []
-            resistances = key_levels.get("resistances", []) if key_levels else []
-            atr = ind_15m.get("atr", 20)
-            vol_surge = ind_15m.get("vol_surge", 1.0)
-
-            # 超卖 + 支撑附近 → 快速做多
-            if (rsi <= 35 and price_now > 0
-                    and any(abs(price_now - s["price"]) / price_now < CFG.osc_level_proximity for s in supports)):
-                _ob_osc = depth.get("imbalance", 0)
-                if _ob_osc <= 0.20:
-                    log.debug(f"🔇 [{sym}] 震荡市超卖信号被OB盘口过滤拦截(imb={_ob_osc:+.3f}≤0.20)，降级为AI推理")
-                elif not self.fast_lane._is_redundant_fast_signal(sym, "OSC_OVERSOLD", "open_long", 0.60, cooldown=600):
-                    log.info(f"📊 [{sym}] 震荡市超卖+支撑，快速做多 RSI={rsi:.1f}")
-                    fast_decision = {
-                        "action": "open_long",
-                        "confidence": 0.60,
-                        "suggested_sl": price_now - atr * CFG.osc_sl_atr_mult,
-                        "suggested_tp": 0,
-                        "suggested_leverage": min(CFG.max_leverage, 6),
-                        "reason": f"震荡市超卖触及支撑 RSI={rsi:.1f}",
-                        "thought_process": "[震荡市快速决策] 超卖+支撑"
-                    }
-            # 超买 + 阻力附近 → 快速做空
-            elif (rsi >= 67 and price_now > 0
-                    and any(abs(price_now - r["price"]) / price_now < CFG.osc_level_proximity for r in resistances)):
-                _ob_osc2 = depth.get("imbalance", 0)
-                if _ob_osc2 >= -0.20:
-                    log.debug(f"🔇 [{sym}] 震荡市超买信号被OB盘口过滤拦截(imb={_ob_osc2:+.3f}≥-0.20)，降级为AI推理")
-                elif not self.fast_lane._is_redundant_fast_signal(sym, "OSC_OVERBOUGHT", "open_short", 0.60, cooldown=600):
-                    log.info(f"📊 [{sym}] 震荡市超买+阻力，快速做空 RSI={rsi:.1f}")
-                    fast_decision = {
-                        "action": "open_short",
-                        "confidence": 0.60,
-                        "suggested_sl": price_now + atr * CFG.osc_sl_atr_mult,
-                        "suggested_tp": 0,
-                        "suggested_leverage": min(CFG.max_leverage, 6),
-                        "reason": f"震荡市超买触及阻力 RSI={rsi:.1f}",
-                        "thought_process": "[震荡市快速决策] 超买+阻力"
-                    }
-            # 缩量回踩支撑 + RSI回升 → 快速做多（量价背离）
-            elif rsi <= 45 and rsi > 35 and vol_surge < 0.7 and price_now > 0:
-                # 缩量且RSI从低位回升，视为有效反弹
-                if any(abs(price_now - s["price"]) / price_now < CFG.osc_level_proximity * 2 for s in supports):
-                    _ob_osc3 = depth.get("imbalance", 0)
-                    if _ob_osc3 <= 0.15:
-                        log.debug(f"🔇 [{sym}] 震荡市缩量回踩被OB盘口过滤拦截(imb={_ob_osc3:+.3f}≤0.15)，降级为AI推理")
-                    elif not self.fast_lane._is_redundant_fast_signal(sym, "OSC_PULLBACK", "open_long", 0.58, cooldown=600):
-                        log.info(f"📊 [{sym}] 震荡市缩量回踩支撑+RSI修复，快速做多 RSI={rsi:.1f} vol_surge={vol_surge:.1f}")
-                        fast_decision = {
-                            "action": "open_long",
-                            "confidence": 0.58,
-                            "suggested_sl": price_now - atr * CFG.osc_sl_atr_mult,
-                            "suggested_tp": 0,
-                            "suggested_leverage": min(CFG.max_leverage, 6),
-                            "reason": f"震荡市缩量回踩支撑 RSI={rsi:.1f} vol={vol_surge:.1f}x",
-                            "thought_process": "[震荡市快速决策] 缩量回踩支撑+RSI修复"
-                        }
-
-        # ── 1.4b 震荡激进专用评分函数（快速决策通道）────────────────────────
-        # BB极值+放量+RSI极端时直接开仓，无需等待AI（比普通震荡更高的量能要求）
-        if not pos.side and _osc_market == "震荡激进" and not silence_triggered and fast_decision is None:
-            rsi_agg     = ind_15m.get("rsi", 50)
-            price_now   = price
-            atr_agg     = ind_15m.get("atr", 20)
-            vol_surge_agg = ind_15m.get("vol_surge", 1.0)
-            bb_pct_agg  = ind_15m.get("bb_pct", 0.5)
-
-            # BB下沿+放量+超卖 → 快速做多（区间底部强支撑反弹）
-            # 第二确认：imbalance > 0.6（买盘深度明显占优）避免在均衡市被假信号骗
-            imb_agg = depth.get("imbalance", 0)
-            if bb_pct_agg <= 0.10 and vol_surge_agg >= 1.5 and rsi_agg <= 35 and abs(imb_agg) > 0.6:
-                # 方向对齐：做多看买盘失衡(imb > 0)
-                if imb_agg <= 0:
-                    log.debug(f"🔇 [{sym}] 震荡激进BB做多信号被OB方向过滤拦截(imb={imb_agg:+.3f}≤0，买方未主导)，降级为AI推理")
-                elif not self.fast_lane._is_redundant_fast_signal(sym, "OSC_BB_LOW", "open_long", 0.65, cooldown=600):
-                    log.info(f"📊 [{sym}] 震荡激进BB下沿+放量+超卖+失衡，快速做多 bb_pct={bb_pct_agg:.2f} vol={vol_surge_agg:.1f} RSI={rsi_agg:.1f} imb={imb_agg:.2f}")
-                    fast_decision = {
-                        "action": "open_long",
-                        "confidence": 0.65,
-                        "suggested_sl": price_now - atr_agg * 1.2,
-                        "suggested_tp": 0,
-                        "suggested_leverage": min(CFG.max_leverage, 8),
-                        "reason": f"震荡激进BB下沿+放量+超卖+失衡 imb={imb_agg:.2f} vol={vol_surge_agg:.1f}x RSI={rsi_agg:.1f}",
-                        "thought_process": "[震荡激进快速决策] BB下沿+放量+超卖+盘口失衡确认"
-                    }
-            # BB上沿+放量+超买 → 快速做空（区间顶部强压力回落）
-            elif bb_pct_agg >= 0.90 and vol_surge_agg >= 1.5 and rsi_agg >= 65 and abs(imb_agg) > 0.6:
-                # 方向对齐：做空看卖盘失衡(imb < 0)
-                if imb_agg >= 0:
-                    log.debug(f"🔇 [{sym}] 震荡激进BB做空信号被OB方向过滤拦截(imb={imb_agg:+.3f}≥0，卖方未主导)，降级为AI推理")
-                elif not self.fast_lane._is_redundant_fast_signal(sym, "OSC_BB_HIGH", "open_short", 0.65, cooldown=600):
-                    log.info(f"📊 [{sym}] 震荡激进BB上沿+放量+超买+失衡，快速做空 bb_pct={bb_pct_agg:.2f} vol={vol_surge_agg:.1f} RSI={rsi_agg:.1f} imb={imb_agg:.2f}")
-                    fast_decision = {
-                        "action": "open_short",
-                        "confidence": 0.65,
-                        "suggested_sl": price_now + atr_agg * 1.2,
-                        "suggested_tp": 0,
-                        "suggested_leverage": min(CFG.max_leverage, 8),
-                        "reason": f"震荡激进BB上沿+放量+超买+失衡 imb={imb_agg:.2f} vol={vol_surge_agg:.1f}x RSI={rsi_agg:.1f}",
-                        "thought_process": "[震荡激进快速决策] BB上沿+放量+超买+盘口失衡确认"
-                    }
 
         # ── Fast Decision 上下文（signal_hint 非绑定参考）────────────────────
         _fast_context = ""
-        if fast_decision is not None:
-            # 规则引擎信号置信度上限，防止绕过 AI 决策
-            fast_decision["confidence"] = min(fast_decision.get("confidence", 0.5), 0.72)
-            _fd_src = fast_decision.get("thought_process", "")
-            _fd_act = fast_decision["action"]
-            _fd_dir = "short" if _fd_act == "open_short" else "long"
-            _fd_vol = ind_15m.get("vol_surge", 0)
-            _fd_ob  = depth.get("imbalance", 0)
+        # ── 规则引擎信号注入 prompt（非绑定，仅参考）─────────────────────
+        _rs_type = rule_result.get("signal_type", "") if rule_result else ""
+        _rs_conf = rule_result.get("confidence", 0) if rule_result else 0
+        _rs_reason = rule_result.get("reason", "") if rule_result else ""
+        if _rs_type in ("long", "short"):
+            _rs_grade = "S" if _rs_conf >= 0.90 else ("A" if _rs_conf >= 0.80 else "B")
+            _rs_dir = "short" if _rs_type == "short" else "long"
+            _rs_vol = ind_15m.get("vol_surge", 0)
+            _rs_ob  = depth.get("imbalance", 0)
             _fast_context = (
                 f"\n[规则引擎参考信号(非绑定)]\n"
-                f"方向: {_fd_dir} | 置信度: {fast_decision.get('confidence', 0):.2f} | "
-                f"来源: {_fd_src[:50]}\n"
-                f"成交量: {_fd_vol:.1f}x | 盘口失衡: {_fd_ob:+.3f} | "
-                f"原因: {fast_decision.get('reason', '')[:60]}\n"
+                f"等级: {_rs_grade}级 | 方向: {_rs_dir} | 置信度: {_rs_conf:.2f} | "
+                f"成交量: {_rs_vol:.1f}x | 盘口失衡: {_rs_ob:+.3f} | "
+                f"原因: {_rs_reason[:80]}\n"
             )
+
+        # ── 打板检测信号注入（不再直出，仅注入 prompt）────────────────────
+        if not pos.side:
+            _bo_up = self.signals._detect_breakout(raw_15m, price, direction="long", ind_15m=ind_15m, market_mode=market_mode)
+            _bo_dn = self.signals._detect_breakout(raw_15m, price, direction="short", ind_15m=ind_15m, market_mode=market_mode)
+            if _bo_up.get("breakout") and _bo_up.get("confidence", 0) >= CFG.breakout_conf_min:
+                _fast_context += f"\n[打板信号] 向上突破 conf={_bo_up.get('confidence'):.2f} | {_bo_up.get('reason','')[:80]}\n"
+            elif _bo_dn.get("breakout") and _bo_dn.get("confidence", 0) >= CFG.breakout_conf_min:
+                _fast_context += f"\n[打板信号] 向下跌破 conf={_bo_dn.get('confidence'):.2f} | {_bo_dn.get('reason','')[:80]}\n"
+
+        # ── 信号纯度评分注入（供 AI 参考）───────────────────────────────
+        _fast_context += f"\n[信号纯度 SignalPurity] {_purity:.2f}/1.00 | "
+        if _purity >= 0.70:
+            _fast_context += "高质量信号，多维度一致\n"
+        elif _purity >= 0.55:
+            _fast_context += "中等质量，部分指标有分歧\n"
+        else:
+            _fast_context += "低质量信号，多指标矛盾，建议保守\n"
 
         # ── EAT-FLOW 吃单流量 + VSpike 突增（注入 fast_context）────────────
         _vs = self.vspike.get_status()
@@ -2721,7 +2702,7 @@ class ETHTrader:
         # 触发条件：VSpike 突增 / 震荡激进市 / absorption 冰山单信号
         _ef_trigger = (
             _vs.get("is_spike")
-            or _osc_market == "震荡激进"
+            or market_mode == "震荡激进"
             or _vs.get("absorption")
         )
         if _vs.get("has_flow_data") and _ef_trigger:
@@ -2752,9 +2733,25 @@ class ETHTrader:
             _cvd_pct = abs(_cvd) / max(_cvd_total, 1) * 100
             _fast_context += (
                 f"\n[CVD成交量净额] {_cvd_dir} | "
-                f"累计 {_cvd:+.0f}张 / {_cvd_total:.0f}张(占比{_cvd_pct:.0f}%)"
+                f"累计净量 {_cvd:+.0f}张 (正值=主动买入主导 / 负值=主动卖出主导) / 总成交{_cvd_total:.0f}张(占比{_cvd_pct:.0f}%)"
                 f" | {'主动买入主导' if _cvd > 0 else '主动卖出主导' if _cvd < 0 else '多空均衡'}\n"
             )
+
+        # ── 持仓时 VSpike 翻转警告（关键！）──
+        _vs_dir = _vs.get("direction", "")
+        _vs_buy_pct = _vs.get("buy_pct", 0.5)
+        _vs_mult = _vs.get("mult", 0.0)
+        if pos.side and _vs.get("is_spike") and _vs_mult >= 5.0:
+            _against = (
+                (pos.side == "short" and "买方主导" in _vs_dir) or
+                (pos.side == "long" and "卖方主导" in _vs_dir)
+            )
+            if _against:
+                _fast_context += (
+                    f"\n⚠️ 【VSpike反向警告】当前持仓{pos.side}，"
+                    f"但VSpike {_vs_mult:.1f}x {_vs_dir} (buy={_vs_buy_pct:.0%})，"
+                    f"量能强烈反向！立即评估是否close！\n"
+                )
 
         # VSpike：仅在突增事件发生时额外提示
         if _vs.get("is_spike"):
@@ -2792,9 +2789,9 @@ class ETHTrader:
         #   震荡激进 / 冰山信号 → 完整注入
         #   趋势市             → 仅在 slope_ratio 极值时注入单行
         #   普通震荡           → 有明显 wall 或 imbal_near 偏斜时才完整注入
-        if _osc_market == "震荡激进" or _has_iceberg:
+        if market_mode == "震荡激进" or _has_iceberg:
             _full_ob = True
-        elif _osc_market == "趋势":
+        elif market_mode == "趋势":
             _full_ob = False
             if _sr >= 1.4 or _sr <= 0.65:
                 _fast_context += (
@@ -2830,74 +2827,39 @@ class ETHTrader:
             if _ob_lines:
                 _fast_context += "\n[🏗 OB订单簿结构]\n" + "\n".join(_ob_lines) + "\n"
 
-        # ── 规则引擎触发AI路径防抖：防止 trigger_ai=True 时无限刷屏 ───────────
-        _rule_full_triggered = (
-            pos.side is None   # 空仓
-            and rule_result is not None
-            and rule_result.get("trigger_ai") is True
-            and rule_result.get("signal_type") not in ("long", "short")  # 非快速决策信号
-        )
-        _rule_debounce_hit = False
-        if _rule_full_triggered:
-            _vs4r = self.vspike.get_status()
-            _spike_bypass_r = _vs4r.get("spike_just_triggered", False)
-            _rule_conf_r = rule_result.get("confidence", 0)
-            _rule_reason_r = rule_result.get("reason", "")
-            _urgent_kw = ("控险", "止损", "风险", "假突破", "逆势", "危险", "破位", "逃生")
-            _is_urgent_rule = _rule_conf_r >= 0.75 or any(k in _rule_reason_r for k in _urgent_kw)
-            if self.fast_lane._is_redundant_fast_signal(sym, "RULE_FULL", "trigger_full_ai", _rule_conf_r,
-                                               cooldown=300, force_bypass=(_spike_bypass_r or _is_urgent_rule)):
-                _rule_debounce_hit = True
-                log.debug(f"🛡️ [{sym}] 规则引擎AI触发防抖命中（conf={_rule_conf_r:.2f}），跳过本次完整推理")
-            elif _is_urgent_rule:
-                log.warning(f"⚡ [{sym}] 规则引擎紧急信号绕过防抖: {_rule_reason_r}")
+        if not silence_triggered and fast_decision is None:
+            # 冻结当前 VSpike 快照，供 AI 决策与后续 ConvictionScore 共用
+            _vs_frozen = self.vspike.get_status()
+            _vs_mult_fr = _vs_frozen.get("mult", 0.0) if (
+                _vs_frozen.get("is_spike") or _vs_frozen.get("spike_recent")
+            ) else 0.0
+            _vs_dir_fr = _vs_frozen.get("direction", "均衡")
 
-        if not silence_triggered and not _rule_debounce_hit:
-            # ── AGGRESSIVE 冲突冷却：多空冲突后方向未变，复用 hold ──
-            if self._check_aggressive_conflict_cooldown():
-                if self._should_log(f"aggressive_cd_{sym}", 120.0):
-                    log.info(f"⏸️ [{sym}] AGGRESSIVE冲突冷却期：方向未变，跳过 AI 调用")
-                decision = self.fast_lane._get_ai_decision(symbol=sym)
-                if decision is None:
-                    decision = {"action": "hold", "confidence": 0.5, "reason": "AGGRESSIVE冲突冷却期"}
-            # ── 冷却期预判：在调 AI 之前检查，避免白烧 API 费用和延迟 ──
-            elif not self._check_cooling_preempt(_osc_market):
-                if self._should_log(f"cooling_preempt_{sym}", 120.0):
-                    log.info(f"⏸️ [{sym}] 冷却期预判：跳过 AI 调用，节省 API 费用")
-                # 用缓存决策降级为 hold
-                decision = self.fast_lane._get_ai_decision(symbol=sym)
-                if decision is None:
-                    decision = {"action": "hold", "confidence": 0.5, "reason": "冷却期预判跳过"}
-            else:
-                # AI 异步触发（每品种独立缓存）；即使有 fast_decision 也传上下文让 AI 最终裁决
-                self.fast_lane._trigger_ai_async_sym(
-                    sym, ind_15m, ind_1h, ind_4h, ind_3m, news_data, fg_index, funding,
-                    depth, pos_info, key_levels=key_levels,
-                    funding_history=self.funding_history,
-                    macro_context=macro_context, rag_warning=rag_warning,
-                    market_sentiment=market_sentiment,
-                    sentiment_alert=_sentiment_alert,
-                    fast_context=_fast_context,
-                )
+            # AI 异步触发（每品种独立缓存）；即使有 fast_decision 也传上下文让 AI 最终裁决
+            self.fast_lane._trigger_ai_async_sym(
+                sym, ind_15m, ind_1h, ind_4h, ind_3m, news_data, fg_index, funding,
+                depth, pos_info, key_levels=key_levels,
+                funding_history=self.funding_history,
+                macro_context=macro_context, rag_warning=rag_warning,
+                market_sentiment=market_sentiment,
+                sentiment_alert=_sentiment_alert,
+                fast_context=_fast_context,
+                vs_frozen=_vs_frozen,
+            )
 
-                decision = self.fast_lane._get_ai_decision(symbol=sym)
-                if decision is None:
-                    log.debug(f"⏳ [{sym}] AI 决策未就绪，降级 hold")
-                    decision = {"action": "hold", "confidence": 0.5, "reason": "AI 未就绪"}
+            decision = self._safe_ai_decision(sym, ind_15m, "AI 未就绪")
 
-        elif _rule_debounce_hit:
-            # 防抖命中时，直接用缓存决策（不调用 AI）
-            decision = self.fast_lane._get_ai_decision(symbol=sym)
-            if decision is None:
-                decision = {"action": "hold", "confidence": 0.5, "reason": "AI 未就绪"}
+        # ── 防御：静默路径下 _vs_frozen 等变量可能未定义 ──
+        if '_vs_frozen' not in locals():
+            _vs_frozen = self.vspike.get_status()
+        if '_vs_mult_fr' not in locals():
+            _vs_mult_fr = _vs_frozen.get("mult", 0.0) if (
+                _vs_frozen.get("is_spike") or _vs_frozen.get("spike_recent")
+            ) else 0.0
+        if '_vs_dir_fr' not in locals():
+            _vs_dir_fr = _vs_frozen.get("direction", "均衡")
 
-        # ── 冻结 AI 决策时刻的 VSpike 状态，供后续 ConvictionScore 计算复用 ──
-        # 避免在 _do_open/_calc_size_and_margin 中重新查询导致时间差引入的 VSpike=0 问题
-        _vs_frozen = self.vspike.get_status()
-        _vs_mult_fr = _vs_frozen.get("mult", 0.0) if (
-            _vs_frozen.get("is_spike") or _vs_frozen.get("spike_recent")
-        ) else 0.0
-        _vs_dir_fr = _vs_frozen.get("direction", "均衡")
+        # ── AI 决策后的方向解析与 VSpike Bonus 计算 ──
         _action_fr = decision.get("action", "")
         _is_long_fr = _action_fr == "open_long"
         _is_short_fr = _action_fr == "open_short"
@@ -2916,9 +2878,13 @@ class ETHTrader:
         decision["_vs_score_mult_frozen"] = _vs_score_mult_fr
         decision["_vs_score_mult_frozen_ts"] = time.monotonic()  # 过期时间戳
 
-        # ── AI 对快速决策的最终裁决（适用于所有AI路径，含防抖命中路径）──────────
-        # 修复：原代码裁决块在 if not silence 内，_rule_debounce_hit 时 fast_decision 被静默丢弃
-        if fast_decision is not None and not silence_triggered:
+        # 【核心修复】高置信度规则引擎信号（conf≥0.75）→ 跳过 ConvictionScore pre-check
+        # 避免 AI hold 决策覆盖 rule engine 的 open 信号，导致错过快速行情
+        _rule_high_conf_bypass = (
+            decision.get("action", "") in ("open_long", "open_short")
+            and decision.get("confidence", 0) >= 0.75
+        )
+        if fast_decision is not None and not silence_triggered and not _rule_high_conf_bypass:
             _use_fast = decision.get("use_fast_decision", False)
             _ai_conf_for_fast = decision.get("confidence", 0)
             _fast_conf = fast_decision.get("confidence", 0)
@@ -2931,7 +2897,13 @@ class ETHTrader:
             if _ai_action in ("open_long", "open_short"):
                 self._last_ai_directional[sym] = (_ai_action, time.monotonic())
             _path_b = False  # 禁用 Path B，以 AI 决策为主
-            if _path_a or _path_b:
+            # 路径C：规则引擎明确信号（conf≥0.65）直出，经 ConvictionScore 把关
+            _path_c = (
+                fast_decision is not None
+                and fast_decision.get("action", "") in ("open_long", "open_short")
+                and fast_decision.get("confidence", 0) >= 0.65
+            )
+            if _path_a or _path_b or _path_c:
                 # ── fast_decision 独立 Bypass Lane（规则引擎高分 bypass AI门槛）────────
                 if fast_decision is not None:
                     # 获取当前 VSpike 状态（方向对齐倍数，供 BypassLane 使用）
@@ -2960,9 +2932,6 @@ class ETHTrader:
                         rsi          = ind_15m.get("rsi", 50.0) if ind_15m else 50.0,
                         at_key_level = _near_level,
                         market_mode  = self._market_mode,
-                        # ── 新闻/恐贪维度（建议3）──
-                        news_sentiment = news_data.get("sentiment", 0.0) if news_data else 0.0,
-                        fear_greed     = fg_index.get("value", 50) if fg_index else 50,
                         context      = {
                             "atr_ratio": ind_15m.get("atr_ratio", 1.0) if ind_15m else 1.0,
                             "trend_alignment_score": _ts_fast,
@@ -3038,42 +3007,43 @@ class ETHTrader:
                         self.fast_lane._clear_ai_cache(symbol=sym)
                         self._bypass_kelly_override = _ar_res["kelly_override"]
                         return
-                # ── ConvictionScore 预检：低分信号提前拦截，避免空跑开仓流程 ────
-                if _fd_score["score"] < CFG.conviction_open_min:
-                    _fd_action_rej = fast_decision.get("action", "")
-                    _rej_key = f"{sym}_{_fd_action_rej}"
-                    _prev_rej = self._fast_rejection_cache.get(_rej_key)
-                    _rej_count = (_prev_rej[1] + 1) if _prev_rej else 1
-                    self._fast_rejection_cache[_rej_key] = (_fd_action_rej, _rej_count, time.monotonic())
-                    _fd_comps = _fd_score.get("components", {})
-                    log.info(
-                        f"🚫 [{sym}] 快速决策预检拦截: ConvictionScore={_fd_score['score']:.1f}"
-                        f" < {CFG.conviction_open_min} "
-                        f"(ai_raw={_fd_comps.get('ai_raw',0):.0f} spike={_fd_comps.get('spike',0):.0f} "
-                        f"ob={_fd_comps.get('ob',0):.1f}) "
-                        f"第{_rej_count}次拒绝，信号降级"
-                    )
-                    fast_decision = None
-                    return
-                _debounce_tag = "[防抖路径]" if _rule_debounce_hit else ""
-                _fd_reason = fast_decision.get("reason", "")
-                log.info(f"✅ [{sym}] 快速决策执行{_debounce_tag}（{_fd_reason}）→ {fast_decision['action']}")
-                decision = fast_decision
-                self.fast_lane._clear_ai_cache(symbol=sym)
-                # 成功执行快速决策时，清除该信号的拒绝记录
-                _rej_key_ok = f"{sym}_{fast_decision.get('action', '')}"
-                self._fast_rejection_cache.pop(_rej_key_ok, None)
-            else:
-                log.info(f"⏳ [{sym}] AI 否决快速决策（use_fast={_use_fast} ai_conf={_ai_conf_for_fast:.2f} fast_conf={_fast_conf:.2f}），转完整推理")
-                fast_decision = None  # 丢弃快速决策，由 AI 推理接管
+                # ── ConvictionScore 降级为参考指标：记录分数，不再拦截/降级快速决策 ──
+                if fast_decision is not None:
+                    _fd_score_q = _fd_score.get("score", 0.0)
+                    _base_thresh_q = self._get_conviction_open_thresh()
+                    if _vs_score_mult >= 6.0:
+                        _fd_thresh_q = max(48.0, _base_thresh_q - 8.0)
+                    elif _vs_score_mult >= 4.0:
+                        _fd_thresh_q = max(50.0, _base_thresh_q - 6.0)
+                    elif _vs_score_mult >= 3.0:
+                        _fd_thresh_q = max(52.0, _base_thresh_q - 4.0)
+                    else:
+                        _fd_thresh_q = _base_thresh_q
+                    if _fd_score_q < _fd_thresh_q:
+                        log.warning(
+                            f"⚠️ [{sym}] [ConvictionScore参考] 快速决策 Score={_fd_score_q:.1f}"
+                            f" < {_fd_thresh_q:.1f}({self._market_mode})，作为参考记录，不拦交易"
+                        )
+                    else:
+                        log.debug(
+                            f"✅ [{sym}] ConvictionScore 快速预检={_fd_score_q:.1f} ≥ {_fd_thresh_q:.1f}，通过"
+                        )
+                if fast_decision is not None:
+                    _fd_reason = fast_decision.get("reason", "")
+                    log.info(f"✅ [{sym}] 快速决策执行（{_fd_reason}）→ {fast_decision['action']}")
+                    decision = fast_decision
+                    self.fast_lane._clear_ai_cache(symbol=sym)
+                else:
+                    log.info(f"⏳ [{sym}] AI 否决快速决策（use_fast={_use_fast} ai_conf={_ai_conf_for_fast:.2f} fast_conf={_fast_conf:.2f}），转完整推理")
+                    fast_decision = None  # 丢弃快速决策，由 AI 推理接管
 
-        # ── AI hold 时主动打破静默（force_wakeup）───────────────────────────
-        # 只有 action="hold" 时 AI 才会输出 force_wakeup，此时本轮立即打破静默重评
+        # ── AI hold 时主动要求重评（force_wakeup）───────────────────────────
+        # 只有 action="hold" 时 AI 才会输出 force_wakeup，此时本轮立即重评
         _fw = bool(decision.get("force_wakeup", False)) if decision.get("action") == "hold" else False
         if _fw:
-            log.info(f"⚡ [{sym}] AI 输出 hold 但 force_wakeup=true → 强制打破静默，重新决策")
+            log.info(f"⚡ [{sym}] AI hold 但 force_wakeup=true → 清除缓存，下轮强制重评")
             self._last_force_wakeup[sym] = True
-            self.fast_lane._clear_ai_cache(symbol=sym)
+            self.fast_lane._clear_ai_cache(symbol=sym, clear_last=True)
             silence_triggered = False  # 取消本轮静默，下一轮强制走完整 AI
 
         # ── AI 动态 RSI 唤醒阈值 + Level-2 参数建议 ──────────────────────────
@@ -3107,13 +3077,15 @@ class ETHTrader:
                     log.debug(f"Level-2 参数应用失败: {e}")
 
         # 去重日志：相同决策只在内容变化时输出 INFO，重复时降级为 DEBUG
+        # 规则引擎已有 🚀 WARNING 日志，不再重复输出 AI 决策日志
         _disp = {k: v for k, v in decision.items() if k != "thought_process"}
         _sig  = f"{decision.get('action')}|{decision.get('confidence', 0):.2f}|{(decision.get('reason') or '')[:80]}"
         _is_repeat = (_sig == self._last_decision_sig.get(sym, ""))
         self._last_decision_sig[sym] = _sig
         if not _is_repeat:
             _decision_src = "[静默缓存]" if silence_triggered else ("[快速决策]" if fast_decision is not None else "[新决策]")
-            log.info(f"🤖 [{sym}] AI决策{_decision_src}: {_disp}")
+            if not decision.get("reason", "").startswith(("规则", "S级", "A级")):
+                log.info(f"🤖 [{sym}] AI决策{_decision_src}: {_disp}")
             if decision.get("thought_process"):
                 log.debug(f"🤖 [{sym}] 思考过程: {decision['thought_process']}")
         else:
@@ -3133,7 +3105,7 @@ class ETHTrader:
             )
 
             # 市场模式感知（平仓/止损冷却期共用）
-            _trend_exit = _osc_market == "趋势"
+            _trend_exit = market_mode == "趋势"
             # VSpike豁免：趋势市 ≥10x 不要求方向一致（卖方洗盘=做多机会）
             _vs_exempt_mult = 10.0 if _trend_exit else 15.0
             _vs_exempt_dir_ok = True if _trend_exit else _early_vs_dir_ok
@@ -3142,8 +3114,8 @@ class ETHTrader:
             _last_exit_ts = gs_get("last_exit_ts")
             _last_exit_side = gs_get("last_exit_side", "")
             if _last_exit_ts and not _early_blocked:
-                _exit_cd_same = 90.0 if _trend_exit else 180.0   # 同向冷却
-                _exit_cd_opp  = 60.0 if _trend_exit else 90.0    # 反向冷却
+                _exit_cd_same = 45.0 if _trend_exit else 50.0   # 同向冷却
+                _exit_cd_opp  = 45.0 if _trend_exit else 50.0    # 反向冷却
                 _now = datetime.now(UTC)
                 _exit_dt = _parse_dt(_last_exit_ts)
                 _seconds_since_exit = (_now - _exit_dt).total_seconds() if _exit_dt else 999
@@ -3183,16 +3155,41 @@ class ETHTrader:
                         _spike_ok = _early_vspike.get("spike_just_triggered", False) and _early_vspike.get("mult", 0) >= 2.8
                         _rsi = ind_15m.get("rsi", 50) if ind_15m else 50
                         _rsi_ext = (_early_dir == "long" and _rsi < 30) or (_early_dir == "short" and _rsi > 70)
-                        _condA = _price_rc and _conf >= 0.85
-                        _condB = _spike_ok and _early_vs_dir_ok and _rsi_ext and _conf >= 0.68
-                        _condC = (
-                            (_early_vspike.get("is_spike") or _early_vspike.get("spike_recent"))
-                            and _early_vspike.get("mult", 0) >= _vs_exempt_mult and _vs_exempt_dir_ok and _conf >= 0.62
+                        # ── VSpike 反向否决：量能 ≥3x 且方向相反时，禁止条件A ──
+                        _vs_mult_rc = _early_vspike.get("mult", 0)
+                        _vs_dir_rc = _early_vspike.get("direction", "均衡")
+                        _vs_against = (
+                            (_early_dir == "long" and "卖方主导" in _vs_dir_rc) or
+                            (_early_dir == "short" and "买方主导" in _vs_dir_rc)
                         )
+                        _vs_reverse = _vs_mult_rc >= 3.0 and _vs_against
+                        # ── 规则引擎信号限制：固定 conf（0.72~0.76）非 AI 判断，
+                        #    止损冷却豁免仅限 AI 驱动决策（fast_decision is None）──
+                        _is_rule_signal = (fast_decision is not None)
+                        _condA_thresh = _cooldown_progress = 0.0  # 提前定义
+                        if _is_rule_signal:
+                            # 规则引擎信号不享受条件A/B豁免，仅条件C（极端量能≥10x）可豁免
+                            _condA = False
+                            _condB = False
+                            _condC = (
+                                (_early_vspike.get("is_spike") or _early_vspike.get("spike_recent"))
+                                and _early_vspike.get("mult", 0) >= _vs_exempt_mult and _vs_exempt_dir_ok and _conf >= 0.62
+                            )
+                        else:
+                            # AI 驱动决策：完整豁免逻辑
+                            _cooldown_progress = _minutes_ago / _stop_cooldown  # 0~1
+                            _condA_thresh = 0.70 if _cooldown_progress >= 0.5 else 0.75
+                            _condA = _price_rc and _conf >= _condA_thresh and not _vs_reverse
+                            _condB = _spike_ok and _early_vs_dir_ok and _rsi_ext and _conf >= 0.68
+                            _condC = (
+                                (_early_vspike.get("is_spike") or _early_vspike.get("spike_recent"))
+                                and _early_vspike.get("mult", 0) >= _vs_exempt_mult and _vs_exempt_dir_ok and _conf >= 0.62
+                            )
                         if _condA:
                             log.info(
                                 f"⚡ [{sym}] 止损冷却期内，条件A(顺势回归)豁免："
-                                f"AI conf={_conf:.2f}≥0.85，价格已重新站稳，批准开仓"
+                                f"AI conf={_conf:.2f}≥{_condA_thresh:.2f}，价格已重新站稳，"
+                                f"冷却进度={_cooldown_progress:.0%}，批准开仓"
                             )
                         elif _condB:
                             log.warning(
@@ -3221,33 +3218,25 @@ class ETHTrader:
                 self.fast_lane._clear_ai_cache(symbol=sym)
                 return  # 跳过后续委员会/贝叶斯/执行
 
-        # ── 策略委员会校验（快速决策打板信号跳过委员会）─────────────────────
-        # fast_decision 已包含独立技术确认，无需再被委员会审查
-        committee_opposing = 0
-        if (decision.get("action") in ("open_long", "open_short")
-                and not pos.side and fast_decision is None):
-            decision = self._strategy_committee(
-                sym, decision, ind_15m, ind_1h, ind_3m, price, depth=depth
-            )
-
         # ── 贝叶斯后验置信度（结合 AI confidence + 盘口失衡度）──────────────────
         if decision.get("action") in ("open_long", "open_short") and not silence_triggered:
             ai_conf = decision.get("confidence", 0.5)
             imbal = (depth.get("imbalance", 0) if isinstance(depth, dict) else 0)
             # 先验 = 近25笔已平仓胜率（每小时由 update_dynamic_params 动态维护）
-            # 下限 0.40：防止历史极端低胜率（如0.23）压垮 Kelly 算出负仓位导致系统停摆
-            prior = max(0.40, gs_get("last_24h_win_rate", 0.5))
+            # 下限 0.50：承认"错过"≠"做错"，32%低胜率主要来自不敢下单而非方向错误
+            prior = max(0.50, gs_get("last_24h_win_rate", 0.5))
             # 震荡市 prior 上限下调：24h 滚动胜率包含趋势市高胜率，震荡市实际胜率更低
             # 用 0.55 上限防止震荡市系统性高估信号质量
             if self._market_mode in ("震荡", "震荡激进"):
                 prior = min(prior, 0.55)
+
             # P1-1: VSpike≥6x 时压低 imbalance 权重
-            # 极端成交量下挂单簿是不可靠的（做市商挂假单/扫单），不应让它否决真实交易流信号
-            # imbalance 权重从 1.0 降到 0.3，让 AI 置信度主导似然计算
             _vs_bay = self.vspike.get_status()
             _vs_mult_bay = _vs_bay.get("mult", 0) if (
                 _vs_bay.get("is_spike") or _vs_bay.get("spike_recent")
             ) else 0
+            # 极端成交量下挂单簿是不可靠的（做市商挂假单/扫单），不应让它否决真实交易流信号
+            # imbalance 权重从 1.0 降到 0.3，让 AI 置信度主导似然计算
             if _vs_mult_bay >= 6.0:
                 _imbal_weight = 0.3  # 极端量能下挂单簿权重大幅降低
                 log.debug(f"🧮 [{sym}] VSpike={_vs_mult_bay:.1f}x≥6x, imbalance 权重降至 {_imbal_weight}")
@@ -3295,7 +3284,8 @@ class ETHTrader:
             "price":        price,
             "rsi":         ind_15m.get("rsi", 0),
             "atr":         round(ind_15m.get("atr", 0), 4),
-            "market_mode":  _osc_market,
+            "market_mode":  market_mode,
+            "signal_purity": round(_purity, 2),
             "is_ai":        fast_decision is None,
         }
         self._ai_summaries.append(_summary)
@@ -3337,6 +3327,60 @@ class ETHTrader:
                              f"已执行（逆势阈值0.75已满足），请关注后续表现")
 
         action = decision.get("action", "hold")
+
+        # ── 平仓后强制 Qwen 仲裁：120s 内开仓必须经过 Qwen 二次确认 ──
+        if action in ("open_long", "open_short") and not pos.side:
+            _exit_ts = gs_get("last_exit_ts")
+            if _exit_ts:
+                _exit_dt = _parse_dt(_exit_ts)
+                _exit_age = (datetime.now(UTC) - _exit_dt).total_seconds() if _exit_dt else 999
+                if _exit_age < 120:
+                    _vs_q = self.vspike.get_status()
+                    _exit_reason = gs_get("last_exit_reason", "")[:80]
+                    _qwen_q = self._arbitration.call_qwen(
+                        action       = action,
+                        vspike_mult  = _vs_q.get("mult", 0.0),
+                        ob_imbalance = depth.get("imbalance", 0.0) if isinstance(depth, dict) else 0.0,
+                        rsi          = ind_15m.get("rsi", 50.0) if ind_15m else 50.0,
+                        market_mode  = self._market_mode,
+                        depth_dir    = _vs_q.get("direction", "均衡"),
+                        price        = price,
+                        reason       = decision.get("reason", "")[:60],
+                        rsi_1h       = ind_1h.get("rsi", 50.0) if ind_1h else 50.0,
+                        rsi_4h       = ind_4h.get("rsi", 50.0) if ind_4h else 50.0,
+                        exit_reason  = _exit_reason,
+                        imbal_near   = depth.get("imbal_near", 0.0) if isinstance(depth, dict) else 0.0,
+                        bid_wall     = f"距{depth.get('bid_wall_dist_pct',0)*100:.1f}% {depth.get('bid_wall_mult',0):.1f}x"
+                                       if isinstance(depth, dict) and depth.get("bid_wall_mult", 0) >= 3.5 else "",
+                        ask_wall     = f"距{depth.get('ask_wall_dist_pct',0)*100:.1f}% {depth.get('ask_wall_mult',0):.1f}x"
+                                       if isinstance(depth, dict) and depth.get("ask_wall_mult", 0) >= 3.5 else "",
+                    )
+                    if _qwen_q:
+                        _qa = _qwen_q.get("action", "hold")
+                        _qc = _qwen_q.get("confidence", 0.5)
+                        # Qwen 反对 → 拦截
+                        if _qa == "hold" or (_qa != action and _qc >= 0.60):
+                            log.warning(
+                                f"🚫 [{sym}] [平仓后Qwen仲裁] L1建议{action} conf={decision.get('confidence',0):.2f}，"
+                                f"Qwen {_qa} conf={_qc:.2f}（距上次平仓{_exit_age:.0f}s < 120s），拦截"
+                            )
+                            action = "hold"
+                            decision["action"] = "hold"
+                            decision["confidence"] = 0.5
+                            decision["reason"] = (
+                                f"平仓后Qwen仲裁未通过 | L1={decision.get('action','')} "
+                                f"vs Qwen={_qa}(conf={_qc:.2f}) | 等待{_exit_age:.0f}s < 120s冷却"
+                            )
+                            return
+                        # Qwen 同意 → 放行
+                        else:
+                            _merged_conf = round((decision.get("confidence", 0) + _qc) / 2, 3)
+                            log.info(
+                                f"✅ [{sym}] [平仓后Qwen仲裁] L1={action} vs Qwen={_qa}(conf={_qc:.2f}) 一致，"
+                                f"合并conf={_merged_conf:.2f}，放行"
+                            )
+                            decision["confidence"] = _merged_conf
+
         # ── 归一化：AI 输出 close_long / close_short → "close"（统一处理路径）
         if action in ("close_long", "close_short"):
             action = "close"
@@ -3410,7 +3454,7 @@ class ETHTrader:
                 # VSpike 趋势捕捉激活中 → 豁免冷静期，允许快进快出
                 _capture_active = (getattr(pos, 'trend_capture_ts', 0) > 0 and
                                    (time.monotonic() - pos.trend_capture_ts) < 1800)
-                _eff_hold = 0 if _capture_active else (600 if _osc_market == "震荡激进" else CFG.min_hold_seconds)
+                _eff_hold = 0 if _capture_active else (600 if market_mode == "震荡激进" else CFG.min_hold_seconds)
                 if hold_secs < _eff_hold:
                     conf = decision.get("confidence", 0)
                     reason = decision.get("reason", "")
@@ -3457,7 +3501,7 @@ class ETHTrader:
             bb_mid = ind_15m.get("bb_mid", 0)
             bb_pct_now = ind_15m.get("bb_pct", 0.5)
             atr_now = ind_15m.get("atr", 0)
-            _osc_mode = _osc_market in ("震荡", "震荡激进")
+            _osc_mode = market_mode in ("震荡", "震荡激进")
             _no_partial_tp = not getattr(pos, 'partial_tp_triggered', False)
 
             # ── Rule 1: 动态 ATR 止盈 ───────────────────────────────────────────
@@ -3548,14 +3592,11 @@ class ETHTrader:
 
         if action == "close" and pos.side:
             # ── AI 驱动平仓架构：AI 置信度为主导，Rule 1-7 仅作参考 ─────────────
-            # 核心理念：开仓需要 DeepSeek/Qwen 多模型确认，平仓同样由 AI 主导决策
-            # Rule 1-7 已降级为信号收集器（_build_exit_context），不再阻断 AI 平仓请求
-            # 唯一硬阻断：核按钮 VSpike（Rule 0.5，≥8x 极端反向量能）→ 立即执行
             conf_close   = decision.get("confidence", 0.0)
             close_reason = decision.get("reason", "AI平仓")
             _exit_ctx    = _build_exit_context(now, decision)
 
-            # ── 核按钮 VSpike：极端量能无条件逃生（最高优先级，绕过所有检查）────
+            # ── 核按钮 VSpike：极端量能无条件逃生（最高优先级）───────────────
             if _exit_ctx["nuclear_safeguard"]:
                 log.critical(
                     f"💥 [{sym}] 核按钮VSpike触发！极端反向量能，立即执行平仓 | "
@@ -3568,63 +3609,48 @@ class ETHTrader:
                 })
                 self._ai_close_pending_until = time.monotonic() + 5.0
                 self.position_exec._close(f"核按钮VSpike平仓 | {close_reason}", decision_id, symbol=sym)
+                # 极端量能平仓后，下一轮立即重评（可能反手）
+                self._last_force_wakeup[sym] = True
+                self.fast_lane._clear_ai_cache(symbol=sym, clear_last=True)
+                log.info(f"⚡ [{sym}] 核按钮平仓后 force_wakeup：下一轮立即重评（极端VSpike上下文）")
                 return
 
-            # ── 冷静期拦截（仅在非紧急情况下阻断）─────────────────────────────
-            if not _exit_ctx["calm_period_ok"]:
-                log.warning(
-                    f"🛡️ [{sym}] 【冷静期拦截】AI平仓请求暂停 | {_exit_ctx['msg']}\n"
-                    f"   AI理由: {close_reason} | conf={conf_close:.2f}"
-                )
-                log_event("calm_period_blocked", {
-                    "sym": sym, "ai_reason": close_reason,
-                    "ai_conf": conf_close, "block_msg": _exit_ctx["msg"]
-                })
-                _spike_peak_ts_now = self.vspike._spike_peak_ts
-                _blocked_until = time.monotonic() + CFG.blocked_close_cooldown
-                self._blocked_close_ctx[sym] = {
-                    "spike_ts":     _spike_peak_ts_now,
-                    "blocked_until": _blocked_until,
-                    "block_price":  price,
-                    "atr":          ind_15m.get("atr", 0),
-                }
-                log.info(f"⏳ [{sym}] 冷静期拦截冷却启动 {CFG.blocked_close_cooldown}s")
-                return
-
-            # ── AI 置信度达标 → 直接执行（不再需要 Rule 1-7 放行）─────────────
-            # 千问仲裁特殊处理：仲裁源 = 千问已做最终裁决，不再二次置信度门控
+            # ── 置信度门槛（千问仲裁直通）───────────────────────────────────
             _is_qwen_arb = decision.get("source") == "qwen_exit_arbitration"
-            _arb_close = conf_close >= CFG.close_confidence_threshold if not _is_qwen_arb else True
-            if _arb_close:
-                self._ai_close_pending_until = time.monotonic() + 5.0
-                _arb_tag = "[千问仲裁]" if _is_qwen_arb else ""
-                _sig_tag = f"[信号:{_exit_ctx['hit_count']}条]" if _exit_ctx["hit_count"] > 0 else "[AI独立判断]"
-                log.info(
-                    f"🔻 [{sym}] AI平仓指令 {conf_close:.2f} {'≥' if not _is_qwen_arb else '=='} {CFG.close_confidence_threshold if not _is_qwen_arb else '仲裁直通'} "
-                    f"{_arb_tag}{_sig_tag} | {close_reason}"
-                )
-                log_event("ai_close_triggered", {
-                    "sym": sym, "confidence": conf_close,
-                    "reason": close_reason, "trigger": "ai_high_conf",
-                    "exit_signals": _exit_ctx["msg"],
-                    "hit_count": _exit_ctx["hit_count"],
-                })
-                self.position_exec._close(
-                    f"AI平仓(conf={conf_close:.2f}) {_sig_tag} {_exit_ctx['msg']} | {close_reason}",
-                    decision_id, symbol=sym
-                )
-            else:
-                # ── AI 置信度不足，延迟执行，由追踪止损控制 ────────────────────
-                log.info(
-                    f"⚠️ [{sym}] AI平仓置信度 {conf_close:.2f} < {CFG.close_confidence_threshold}，"
-                    f"延迟执行，由追踪止损控制离场 | 原因: {close_reason}"
-                    f" | 离场信号: {_exit_ctx['msg']}"
-                )
-                log_event("ai_close_deferred", {
-                    "sym": sym, "confidence": conf_close,
-                    "reason": close_reason, "trigger": "deferred_to_trailing",
-                    "exit_signals": _exit_ctx["msg"]
-                })
+            if not _is_qwen_arb:
+                _close_thresh = 0.68
+                if conf_close < _close_thresh:
+                    log.info(
+                        f"🛡️ [{sym}] 平仓置信度 {conf_close:.2f} < {_close_thresh:.2f}，"
+                        f"降级为 hold | {close_reason}"
+                    )
+                    return
+
+            # ── AI 置信度达标 → 执行平仓 ──────────────────────────────────
+            _arb_tag = "[千问仲裁]" if _is_qwen_arb else ""
+            _sig_tag = f"[信号:{_exit_ctx['hit_count']}条]" if _exit_ctx["hit_count"] > 0 else "[AI独立判断]"
+            _phase_tag = "趋势市" if market_mode == "趋势" else "震荡市"
+            log.info(
+                f"🔻 [{sym}] AI平仓指令 conf={conf_close:.2f} "
+                f"{'仲裁直通' if _is_qwen_arb else f'(阈值{_close_thresh:.2f} {_phase_tag})'} "
+                f"{_arb_tag}{_sig_tag} | {close_reason}"
+            )
+            log_event("ai_close_triggered", {
+                "sym": sym, "confidence": conf_close,
+                "reason": close_reason, "trigger": "ai_phase_approved",
+                "exit_signals": _exit_ctx["msg"],
+                "hit_count": _exit_ctx["hit_count"],
+            })
+            self.position_exec._close(
+                f"AI平仓(conf={conf_close:.2f}) {_sig_tag} {_exit_ctx['msg']} | {close_reason}",
+                decision_id, symbol=sym
+            )
+            # 极端量能平仓后，下一轮立即重评（可能反手）
+            _vs_fw = self.vspike.get_status()
+            if _vs_fw.get("mult", 0.0) >= CFG.vspike_extreme_mult:
+                self._last_force_wakeup[sym] = True
+                self.fast_lane._clear_ai_cache(symbol=sym, clear_last=True)
+                log.info(f"⚡ [{sym}] AI平仓后 force_wakeup：VSpike={_vs_fw.get('mult',0):.1f}x极端量能，下一轮立即重评")
             return
 
         if action == "adjust_sl_tp" and pos.side:
@@ -3644,6 +3670,64 @@ class ETHTrader:
                 log.debug(f"[_run_symbol] 金字塔检查异常: {e_pyr}")
 
         if action in ("open_long", "open_short") and not pos.side:
+            # ── 启动冷却期：Bot 重启后至少等待 N 秒再允许开仓（等 ATR 稳定 + 观察初始波动）──
+            _startup_age = time.monotonic() - self._boot_ts
+            _startup_cd = getattr(CFG, "startup_cooldown_seconds", 180)
+            if _startup_age < _startup_cd:
+                log.info(f"🚫 [{sym}] 启动冷却中（{_startup_age:.0f}s < {_startup_cd}s），跳过开仓")
+                # 记录首次出现的信号reason，冷却过期后要求信号已变化
+                _sig_reason = decision.get("reason", "")
+                self._post_cooldown_check[sym] = {
+                    "reason": _sig_reason,
+                    "seen_ts": time.monotonic(),
+                }
+                self.fast_lane._clear_ai_cache(symbol=sym)
+                return
+
+            # ── 冷却过期后首次检查：信号新鲜度 + VSpike 方向一致性 ──
+            _blocked = self._post_cooldown_check.pop(sym, None)
+            if _blocked:
+                _sig_reason_now = decision.get("reason", "")
+                _reason_changed = _sig_reason_now != _blocked["reason"]
+                _signal_age = time.monotonic() - _blocked["seen_ts"]
+                # ① 信号新鲜度检查：同一信号持续 ≥120s → 视为陈旧信号
+                if not _reason_changed and _signal_age >= 120:
+                    log.info(
+                        f"🚫 [{sym}] 启动冷却已过，但同信号已持续 {_signal_age:.0f}s ≥120s，"
+                        f"视为陈旧信号（reason={_sig_reason_now}），等待新信号"
+                    )
+                    self.fast_lane._clear_ai_cache(symbol=sym)
+                    return
+
+            # ── 同价位止损冷却：止损后 ±1% 范围内 120s 内不重入 ──
+            _sl_cool_price = self._last_sl_price
+            _sl_cool_time = self._last_sl_time
+            if _sl_cool_price > 0 and price > 0:
+                _sl_dist_pct = abs(price - _sl_cool_price) / _sl_cool_price
+                _sl_cool_age = time.monotonic() - _sl_cool_time
+                if _sl_dist_pct <= 0.01 and _sl_cool_age < 120:
+                    log.warning(
+                        f"🚫 [{sym}] [同价位冷却] 上次止损价={_sl_cool_price:.4f}，"
+                        f"当前价={price:.4f}(±{_sl_dist_pct*100:.2f}%)，冷却剩余{120 - _sl_cool_age:.0f}s，"
+                        f"拦截重入"
+                    )
+                    self.fast_lane._clear_ai_cache(symbol=sym)
+                    return
+
+            # ── 连续被洗记忆：同价位已洗≥2次 → 要求更强信号 ──
+            if self._wash_count_at_price >= 2:
+                _vs_now_wash = self.vspike.get_status()
+                _vs_mult_wash = _vs_now_wash.get("mult", 0.0)
+                _wash_conf = decision.get("posterior_confidence") or decision.get("confidence", 0)
+                if _vs_mult_wash < 5.0 or _wash_conf < 0.65:
+                    log.warning(
+                        f"🚫 [{sym}] [连续被洗] 同价位已洗{self._wash_count_at_price}次，"
+                        f"要求更强信号（VSpike≥5.0x 实际={_vs_mult_wash:.1f}x, "
+                        f"conf≥0.65 实际={_wash_conf:.2f}），拦截"
+                    )
+                    self.fast_lane._clear_ai_cache(symbol=sym)
+                    return
+
             is_long   = (action == "open_long")
 
             # ── 优先使用贝叶斯后验置信度（融合历史胜率+盘口失衡），无后验时用原始置信度 ─
@@ -3651,78 +3735,175 @@ class ETHTrader:
             _post_conf = decision.get("posterior_confidence")
             conf = _post_conf if _post_conf is not None else _raw_conf
 
-            # ── 置信度动态阈值（trend_score 连续化，取代 4H EMA 二元判断）─────────
+            # ── 提前获取 VSpike 状态（1H Veto 豁免和 Regime Score 共用）──
+            _vs_now = self.vspike.get_status()
+            _vs_mult = _vs_now.get("mult", 0.0)
+
+            # ── 1H 大周期趋势 Veto（防止 15m 假突破逆势开仓）──
+            _1h_ema_bull = ind_1h.get("ema_bull", True)
+            _1h_rsi = ind_1h.get("rsi", 50)
+            _1h_opp = (is_long and not _1h_ema_bull) or (not is_long and _1h_ema_bull)
+            # ── VSpike 豁免：极端量能 + AI共识 + 方向一致时，1H 趋势已被实时打破，不应以旧状态否决 ──
+            _vs_dir_match = (
+                (is_long and _vs_now.get("direction") == "买方主导") or
+                (not is_long and _vs_now.get("direction") == "卖方主导")
+            )
+            _1h_veto_vspike_exempt = (
+                _vs_mult >= 8.0
+                and (_vs_now.get("is_spike") or _vs_now.get("spike_recent"))
+                and conf >= 0.55
+                and _vs_dir_match
+            )
+            if _1h_opp and not _1h_veto_vspike_exempt:
+                # 1H 强烈反趋势 → 高置信度才放行
+                _1h_rsi_extreme = (
+                    (is_long and _1h_rsi < 35) or  # 1H RSI 已经超卖，做空是顺势
+                    (not is_long and _1h_rsi > 65)  # 1H RSI 已经超买，做空是顺势
+                )
+                if not _1h_rsi_extreme and conf < 0.75:
+                    _dir_tag = "1H看跌" if is_long else "1H看涨"
+                    log.info(
+                        f"🚫 [{sym}] [1H Veto] {action} 被1H趋势拦截（{_dir_tag}，1H RSI={_1h_rsi:.1f}），"
+                        f"conf={conf:.2f}<0.75，跳过"
+                    )
+                    self.fast_lane._clear_ai_cache(symbol=sym)
+                    return
+                elif _1h_rsi_extreme:
+                    log.info(
+                        f"⚡ [{sym}] [1H Veto] 1H反趋势但RSI极端({_1h_rsi:.1f})，"
+                        f"降低门槛至 0.68 允许左侧开仓"
+                    )
+                    conf = max(conf, 0.68)  # 左侧交易至少 0.68 conf
+                else:
+                    log.info(
+                        f"⚠️ [{sym}] [1H Veto] 1H反趋势但 conf={conf:.2f}≥0.75，"
+                        f"高置信度放行（可能是左侧交易）"
+                    )
+            elif _1h_opp and _1h_veto_vspike_exempt:
+                log.info(
+                    f"⚡ [{sym}] [1H Veto] 1H反趋势但 VSpike={_vs_mult:.1f}x 极端量能 + conf={conf:.2f}≥0.55，"
+                    f"豁免通过（1H 趋势正被实时打破）"
+                )
+
+            # ── 1H Regime Score 硬过滤（补充现有 veto，比 ema_bull 更能反映真实趋势强度）──
+            _1h_regime_score = _compute_1h_regime_score(
+                ind_1h, price, self._market_mode, funding
+            )
+            # 1H Regime Score 硬过滤：纯度评分已过滤最差信号，阈值适度放宽
+            _vspk_priv = _vs_mult >= 6.0 and (_vs_now.get("is_spike") or _vs_now.get("spike_recent"))
+            _reg_lo, _reg_hi = (0.28, 0.72) if _vspk_priv else (0.30, 0.70)
+            _vspk_tag = "" if not _vspk_priv else " [VSpike特权通道]"
+            if action == "open_long" and _1h_regime_score < _reg_lo:
+                log.info(
+                    f"🚫 [{sym}] [1H Regime Veto{_vspk_tag}] long 被拦截 | "
+                    f"1H_regime={_1h_regime_score:.2f}（极弱趋势，阈值={_reg_lo:.2f}）"
+                )
+                self.fast_lane._clear_ai_cache(symbol=sym)
+                return
+            if action == "open_short" and _1h_regime_score > _reg_hi:
+                log.info(
+                    f"🚫 [{sym}] [1H Regime Veto{_vspk_tag}] short 被拦截 | "
+                    f"1H_regime={_1h_regime_score:.2f}（极强趋势，阈值={_reg_hi:.2f}）"
+                )
+                self.fast_lane._clear_ai_cache(symbol=sym)
+                return
+
+            # ── 置信度动态阈值：三层分离（基础 + 修正 + 惩罚）──
             _trend_score, _trend_dir = get_trend_alignment_score(ind_15m, ind_1h, ind_4h)
-            _sym_market_mode = _osc_market
-            adaptive_thresh = CFG.trend_base_conf_thresh * (1.2 - 0.4 * _trend_score)
-            conf_threshold = max(CFG.trend_conf_clamp_min, min(CFG.trend_conf_clamp_max, adaptive_thresh))
+
+            # 层1：基础门槛（按市场模式查表）
+            _base_mode = market_mode if market_mode in ("趋势", "震荡", "震荡激进") else "震荡"
+            _conf_base = {"趋势": 0.55, "震荡": 0.60, "震荡激进": 0.62}[_base_mode]
+
+            # 层2：唯一修正项 — VSpike 特权（≥6x + 方向明确 + 连亏<3 时降门槛）
+            _conf_threshold = _conf_base
+            _vspk_priv = (
+                _vs_mult >= 6.0
+                and (_vs_now.get("is_spike") or _vs_now.get("spike_recent"))
+                and gs_get("consecutive_losses", 0) < 3
+            )
+            if _vspk_priv:
+                _vs_bp = _vs_now.get("buy_pct", 0.5)
+                if _vs_bp >= 0.70 or _vs_bp <= 0.30:
+                    _conf_threshold = max(0.40, _conf_threshold - 0.15)
+                    log.info(
+                        f"⚡ [{sym}] [VSpike特权通道] {_vs_mult:.1f}x + 方向明确(buy={_vs_bp:.0%})"
+                        f" → conf门槛降至 {_conf_threshold:.2f}，首单仓位×0.5"
+                    )
+
+            # 层3：唯一惩罚项 — 连亏加价（非线性递增）
+            _consec = gs_get("consecutive_losses", 0)
+            if _consec >= 5:
+                _extra_conf = 0.12
+            elif _consec >= 3:
+                _extra_conf = 0.06
+            else:
+                _extra_conf = 0.0
+            if _extra_conf > 0:
+                _conf_threshold = min(0.85, _conf_threshold + _extra_conf)
+                log.info(
+                    f"⚠️ [{sym}] 连亏 {_consec} 次，提升开仓 conf 门槛 +{_extra_conf:.2f} → {_conf_threshold:.2f}"
+                )
+
+            conf_threshold = _conf_threshold
 
             if conf < conf_threshold:
                 _src = f"(贝叶斯后验={_post_conf:.3f})" if _post_conf else ""
                 # P1-3: 限频，置信度不足跳过日志每90秒最多输出一次INFO
                 if self._should_log(f"conf_skip_{sym}", 90.0):
-                    log.info(f"⚖️ [{sym}] 置信度 {conf:.2f}{_src} < {conf_threshold:.2f}（趋势={_trend_dir} 强度={_trend_score:.2f}），跳过")
+                    log.info(f"⚖️ [{sym}] 置信度 {conf:.2f}{_src} < {conf_threshold:.2f}，跳过")
                 else:
                     log.debug(f"⚖️ [{sym}] 置信度 {conf:.2f}{_src} < {conf_threshold:.2f}，跳过（限频）")
                 self.fast_lane._clear_ai_cache(symbol=sym)  # 清缓存，防止同一条注定被拒的决策重复撞墙
                 return
 
-            # ── ConvictionScore 预检（AI 路径）：补齐快速决策已有的预检，防止低分开仓 ──
-            _vs_now_cv = self.vspike.get_status()
-            _vs_mult_cv = _vs_now_cv.get("mult", 0.0)
-            _vs_dir_cv = _vs_now_cv.get("direction", "均衡")
-            _is_long_cv = (action == "open_long")
-            _vs_dir_ok_cv = (_is_long_cv and _vs_dir_cv == "买方主导") or (not _is_long_cv and _vs_dir_cv == "卖方主导")
-            _vs_score_mult_cv = _vs_mult_cv if _vs_dir_ok_cv else 0.0
-            _cv_rsi = ind_15m.get("rsi", 50.0) if ind_15m else 50.0
-            _cv_ob_imb = depth.get("imbalance", 0.0) if hasattr(depth, "get") else 0.0
-            _cv_near = False
-            if ind_15m:
-                _cv_price = ind_15m.get("price", 0)
-                _cv_sup = ind_15m.get("support", 0)
-                _cv_res = ind_15m.get("resistance", 0)
-                _cv_near = (_cv_sup > 0 and abs(_cv_price - _cv_sup) / _cv_price < 0.003) or (_cv_res > 0 and abs(_cv_price - _cv_res) / _cv_price < 0.003)
-            _cv_ts, _cv_td = get_trend_alignment_score(ind_15m, ind_1h, ind_4h)
-            _cv_raw_conf = _post_conf if _post_conf is not None else _raw_conf
+            # ── ConvictionScore 综合质量底线（仅拦截极端劣质信号）──
             _cv_score = self._conviction.score(
-                ai_conf=_cv_raw_conf, action=action,
-                vspike_mult=_vs_score_mult_cv, ob_imbalance=_cv_ob_imb,
-                rsi=_cv_rsi, at_key_level=_cv_near, market_mode=self._market_mode,
-                news_sentiment=news_data.get("sentiment", 0.0) if news_data else 0.0,
-                fear_greed=fg_index.get("value", 50) if fg_index else 50,
-                context={"atr_ratio": ind_15m.get("atr_ratio", 1.0) if ind_15m else 1.0,
-                         "trend_alignment_score": _cv_ts},
+                ai_conf=_raw_conf,
+                action=action,
+                vspike_mult=_vs_mult,
+                ob_imbalance=depth.get("imbalance", 0.0) if depth else 0.0,
+                rsi=ind_15m.get("rsi", 50.0),
+                at_key_level=False,
+                market_mode=_sym_market_mode,
+                context={
+                    "buy_pct": _vs_now.get("buy_pct", 0.5),
+                    "atr_ratio": ind_15m.get("atr_ratio", 1.0),
+                },
+            ).get("score", 0.0)
+            if _cv_score < 35.0 and not _vspk_priv:
+                log.warning(f"🚫 [{sym}] ConvictionScore综合质量底线 {_cv_score:.1f}<35，拦截")
+                self.fast_lane._clear_ai_cache(symbol=sym)
+                return
+            decision["_cv_score_frozen"] = _cv_score
+            decision["_cv_score_frozen_ts"] = time.monotonic()
+
+            # ── VSpike 方向一致性检查（防陈旧信号+市场微观翻转）──
+            # 复用 _vs_now（3729行已获取），时间差<3s不影响
+            _vs_mult_open = _vs_now.get("mult", 1.0)
+            _vs_bp_open = _vs_now.get("buy_pct", 0.5)
+            _vs_dir_open = _vs_now.get("direction", "均衡")
+            # ① 显式方向冲突：buy_pct ≥70% 且方向与信号相反 → 拦截
+            _vs_conflict = (
+                (action == "open_long" and "卖方主导" in _vs_dir_open and _vs_bp_open < 0.30) or
+                (action == "open_short" and "买方主导" in _vs_dir_open and _vs_bp_open > 0.70)
             )
-            if _cv_score["score"] < CFG.conviction_open_min:
-                _cv_comps = _cv_score.get("components", {})
-                _rej_action = f"{action}"
-                _rej_key_cv = f"{sym}_{_rej_action}"
-                _prev_rej_cv = self._fast_rejection_cache.get(_rej_key_cv)
-                _rej_count_cv = (_prev_rej_cv[1] + 1) if _prev_rej_cv else 1
-                self._fast_rejection_cache[_rej_key_cv] = (_rej_action, _rej_count_cv, time.monotonic())
-                log.info(
-                    f"🚫 [{sym}] AI路径ConvictionScore预检拦截: score={_cv_score['score']:.1f}"
-                    f" < {CFG.conviction_open_min} "
-                    f"(ai={_cv_comps.get('ai_raw',0):.0f} spike={_cv_comps.get('spike',0):.0f} "
-                    f"ob={_cv_comps.get('ob',0):.1f}) "
-                    f"第{_rej_count_cv}次拒绝"
+            if _vs_conflict:
+                log.warning(
+                    f"🚫 [{sym}] [VSpike硬拦截|开仓阶段] {action} 与量能{_vs_dir_open}冲突"
+                    f"（mult={_vs_mult_open:.1f}x, buy={_vs_bp_open:.0%}），取消开仓"
                 )
                 self.fast_lane._clear_ai_cache(symbol=sym)
                 return
-            _ai_confidence_tag = "[ConvictionScore预检通过]"
-            log.info(f"✅ [{sym}] AI路径ConvictionScore={_cv_score['score']:.1f} {_ai_confidence_tag}")
-
-            # ── VSpike 反向确认：开仓方向与当前量能方向相反且 ≥8x，警告并拦截 ──
-            _vs_mult_open = _vs_now_cv.get("mult", 1.0)
-            _vs_bp_open = _vs_now_cv.get("buy_pct", 0.5)
-            _vs_dir_open = _vs_now_cv.get("direction", "均衡")
-            _vs_against_open = (
+            # ② 极端反向量能 ≥8x → 最后防线
+            _vs_extreme_against = (
                 (action == "open_long" and "卖方主导" in _vs_dir_open and _vs_bp_open < 0.20) or
                 (action == "open_short" and "买方主导" in _vs_dir_open and _vs_bp_open > 0.80)
             )
-            if _vs_mult_open >= 8.0 and _vs_against_open:
+            if _vs_mult_open >= 8.0 and _vs_extreme_against:
                 log.warning(
-                    f"🚫 [{sym}] VSpike反向开仓拦截: {action} 与{_vs_dir_open}量能({_vs_mult_open:.1f}x,buy={_vs_bp_open:.0%})冲突"
+                    f"🛡️ [{sym}] [极端防线|开仓阶段] VSpike≥8x反向拦截: {action} vs {_vs_dir_open}"
+                    f"（mult={_vs_mult_open:.1f}x, buy={_vs_bp_open:.0%}）"
                 )
                 self.fast_lane._clear_ai_cache(symbol=sym)
                 return
@@ -3747,6 +3928,41 @@ class ETHTrader:
                 _dist_pct  = (price - _price_of_level(nearest_sup)) / price
                 if 0 < _dist_pct < level_proximity_thresh:
                     _level_warn = ("short", _price_of_level(nearest_sup), _dist_pct, level_proximity_thresh)
+
+            # ── 关键位 + 近场失衡硬拦截（离关键位 <0.3% 且盘口明显反向）──
+            _imbalance = depth.get("imbalance", 0.0) if depth else 0.0
+            if action == "open_long" and res_levels:
+                _nr = min(res_levels, key=lambda x: abs(_price_of_level(x) - price))
+                _nr_dist = (_price_of_level(_nr) - price) / price
+                if 0 < _nr_dist < 0.003 and _imbalance < -0.30:
+                    if conf < 0.78:
+                        log.info(
+                            f"🚫 [{sym}] [关键位+OB Veto] long 被拦截 | "
+                            f"距阻力 {_nr_dist*100:.2f}%, imbalance={_imbalance:.2f}"
+                        )
+                        self.fast_lane._clear_ai_cache(symbol=sym)
+                        return
+                    else:
+                        log.warning(
+                            f"⚠️ [{sym}] [关键位+OB Veto] 高置信度逃逸 | "
+                            f"距阻力 {_nr_dist*100:.2f}%, imbalance={_imbalance:.2f}, conf={conf:.2f}"
+                        )
+            elif action == "open_short" and sup_levels:
+                _ns = min(sup_levels, key=lambda x: abs(_price_of_level(x) - price))
+                _ns_dist = (price - _price_of_level(_ns)) / price
+                if 0 < _ns_dist < 0.003 and _imbalance > 0.30:
+                    if conf < 0.78:
+                        log.info(
+                            f"🚫 [{sym}] [关键位+OB Veto] short 被拦截 | "
+                            f"距支撑 {_ns_dist*100:.2f}%, imbalance={_imbalance:.2f}"
+                        )
+                        self.fast_lane._clear_ai_cache(symbol=sym)
+                        return
+                    else:
+                        log.warning(
+                            f"⚠️ [{sym}] [关键位+OB Veto] 高置信度逃逸 | "
+                            f"距支撑 {_ns_dist*100:.2f}%, imbalance={_imbalance:.2f}, conf={conf:.2f}"
+                        )
 
             # ── 已有持仓，禁止重复开仓 ────────────────────────────────────
             if self.pos.side:
@@ -3803,20 +4019,51 @@ class ETHTrader:
             if not _risk_mult_from_ai:
                 log.debug(f"📐 [{sym}] 统一风险因子链: market={market_factor:.2f} × consec={consec_factor:.2f} × dyn={self.dynamic_risk_factor:.2f} → risk_mult={risk_mult:.3f}")
 
+            # ── VSpike ≥6x 特权通道首单仓位减半（连亏≥3时不生效）──
+            _vspk_priv_size = (
+                _vs_mult >= 6.0
+                and (_vs_now.get("is_spike") or _vs_now.get("spike_recent"))
+                and gs_get("consecutive_losses", 0) < 3
+            )
+            if _vspk_priv_size:
+                _vs_bp_s = _vs_now.get("buy_pct", 0.5)
+                _vs_dir_strong_s = _vs_bp_s >= 0.70 or _vs_bp_s <= 0.30
+                if _vs_dir_strong_s:
+                    risk_mult = round(risk_mult * 0.5, 4)
+                    log.info(
+                        f"🔒 [{sym}] [VSpike特权通道] 首单仓位×0.5 → risk_mult={risk_mult:.4f}"
+                    )
+
+            # ── 滑点自适应（高波动时放宽漂移容忍 + 降仓位降风险）──────────────
+            _atr_val = ind_15m.get("atr", 0)
+            _atr_q = _get_atr_quantile(_atr_val, self._atr_history) if _atr_val > 0 else 0.5
+            _vs_now_slip = self.vspike.get_status()
+            _vs_mult_slip = _vs_now_slip.get("mult", 0.0)
+            _slip_adaptive = _atr_q > 0.85 or _vs_mult_slip >= 5.0
+            _slip_risk_mult = 1.0  # 默认不调整
+            _adaptive_drift = CFG.open_wait_price_drift_pct
+            if _slip_adaptive:
+                _adaptive_drift = CFG.open_wait_price_drift_pct * 2.5
+                _slip_risk_mult = 0.7
+                log.info(
+                    f"🌊 [{sym}] 滑点自适应激活（ATR分位={_atr_q:.2f}, VSpike={_vs_mult_slip:.1f}x）："
+                    f"漂移阈值 {CFG.open_wait_price_drift_pct*100:.1f}%→{_adaptive_drift*100:.2f}%, risk_mult×{_slip_risk_mult}"
+                )
+
             # ── AI 指导的开仓等待 + 价格稳定性检查 ─────────────────────────
             _wait_sec = int(decision.get("wait_seconds", 0))
             _wait_sec = max(0, min(_wait_sec, 5))   # 硬限 0~5 秒，防 AI 给出过长等待
             if _wait_sec > 0:
-                log.info(f"⏱️ [{sym}] AI 建议等待 {_wait_sec}s 后开仓（价格漂移阈值={CFG.open_wait_price_drift_pct*100:.1f}%）")
+                log.info(f"⏱️ [{sym}] AI 建议等待 {_wait_sec}s 后开仓（价格漂移阈值={_adaptive_drift*100:.1f}%）")
                 time.sleep(_wait_sec)
                 fresh_price = self._get_price(sym)
                 if fresh_price > 0 and price > 0:
                     drift = abs(fresh_price - price) / price
-                    if drift > CFG.open_wait_price_drift_pct:
+                    if drift > _adaptive_drift:
                         log.info(
                             f"🚫 [{sym}] 价格稳定性检查失败：等待 {_wait_sec}s 后价格从 {price:.4f} "
                             f"漂移至 {fresh_price:.4f}（偏离 {drift*100:.3f}% > "
-                            f"{CFG.open_wait_price_drift_pct*100:.1f}%），自动取消开仓"
+                            f"{_adaptive_drift*100:.1f}%），自动取消开仓"
                         )
                         return
                     log.info(f"✅ [{sym}] 价格稳定性检查通过（漂移 {drift*100:.3f}%），执行开仓")
@@ -3896,16 +4143,24 @@ class ETHTrader:
             if _reg_open < 0.3 and action in ("open_long", "open_short"):
                 _ai_reason = decision.get("reason", "") or ""
                 _breakout_kw = ("突破", "breakout", "break out", "破位", "新高", "新低", "突穿", "站上", "跌破")
-                _negation_prefixes = ("未", "没", "不", "非", "无", "假", "疑", "而非", "并非", "不算", "不是")
-                def _is_true_breakout(reason: str, kw: str) -> bool:
-                    """排除否定/反义语境：'未跌破'、'假突破'、'而非突破' 不算追突破"""
-                    idx = reason.lower().find(kw)
-                    if idx < 0:
-                        return False
-                    # 检查关键词前1~3个字符是否包含否定/反义词
-                    prefix = reason[max(0, idx - 3):idx]
-                    return not any(neg in prefix for neg in _negation_prefixes)
-                _is_breakout_ai = any(_is_true_breakout(_ai_reason, kw) for kw in _breakout_kw)
+                # 排除语义完整的否定/反义短语（取代原来的 3 字符前缀检测，覆盖更准）
+                _false_breakout_phrases = (
+                    "回踩突破", "突破失败", "假突破", "突破后回落", "前期突破",
+                    "未突破", "没有突破", "不突破", "突破未果", "突破后回踩",
+                    "突破无效", "突破被吞没",
+                )
+                # 优先：任何假突破短语出现在 reason 中 → 整个不算追突破
+                _is_breakout_ai = any(fp in _ai_reason for fp in _false_breakout_phrases)
+                if not _is_breakout_ai:
+                    # 兜底：关键词匹配 + 前缀否定检查
+                    _negation = ("未", "没", "不", "非", "无", "假", "疑", "而非", "并非", "不算", "不是")
+                    def _is_true_breakout(reason: str, kw: str) -> bool:
+                        idx = reason.lower().find(kw)
+                        if idx < 0:
+                            return False
+                        prefix = reason[max(0, idx - 3):idx]
+                        return not any(neg in prefix for neg in _negation)
+                    _is_breakout_ai = any(_is_true_breakout(_ai_reason, kw) for kw in _breakout_kw)
                 if _is_breakout_ai:
                     log.warning(
                         f"⚠️ [逻辑熔断] Regime({_reg_open:.2f})<0.3，AI 疑似追突破"
@@ -3915,6 +4170,7 @@ class ETHTrader:
                         "sym": sym, "regime": _reg_open,
                         "action": action, "reason": _ai_reason[:80]
                     })
+                    self.fast_lane._clear_ai_cache(symbol=sym)
                     return
 
             # ── 开仓前健康检查：REST 验证本地空仓与交易所一致 ──────────────
@@ -3941,32 +4197,22 @@ class ETHTrader:
                           risk_mult=risk_mult, symbol=sym,
                           market_mode=_sym_market_mode, ind_15m=ind_15m,
                           pyramid_plan=_pyramid_plan,
-                          committee_opposing=committee_opposing,
                           depth=depth,
-                          trend_score=_trend_score)
+                          trend_score=_trend_score,
+                          news_sentiment=news_data.get("sentiment", 0.0) if news_data else 0.0,
+                          fear_greed=fg_index.get("value", 50) if fg_index else 50,
+                          slip_risk_mult=_slip_risk_mult)
+            # 开仓后重置 AI 门控器时间戳
+            self._ai_gate._last_request_ts = time.monotonic()
+            self._ai_gate._last_decision_price = price
+            self._ai_gate._last_decision_rsi = ind_15m.get("rsi", 50)
+            self._ai_gate._last_decision_macd = ind_15m.get("macd_hist", 0)
 
-        # ── ConvictionScore 拒绝处理：强制静默等待，防止非 hold 动作无限重试 ───
-        # 当 _do_open 因 ConvictionScore < 阈值而 skip 时，该信息通过 _cv_rejected_decision 传递
-        _cv_rej = getattr(self, '_cv_rejected_decision', None)
-        if _cv_rej:
-            _cv_rej_action, _cv_rej_score, _cv_rej_ts = _cv_rej
-            self._consecutive_hold += 1
-            # 使用 AI 建议的 wait_seconds 或强制最少 45s 静默（防止 13s 超频重试）
-            _ai_wait = int(decision.get("wait_seconds", -1))
-            self._ai_hold_wait = max(45, min(300, _ai_wait)) if _ai_wait >= 0 else 60
-            # 清除 AI 决策缓存，避免同一条被拒绝的决策被反复使用
-            self.fast_lane._clear_ai_cache(symbol=sym)
-            log.info(
-                f"🛡️ [{sym}] ConvictionScore 拒绝 → 强制静默 "
-                f"(action={_cv_rej_action} score={_cv_rej_score:.1f} "
-                f"wait={self._ai_hold_wait}s)"
-            )
-            self._cv_rejected_decision = ()  # 处理后清除
-        # ── 连续 hold 计数（用于自适应静默间隔）────────────────────────────
-        elif action in ("hold", "skip", "adjust_sl_tp"):
+        # ── 连续 hold 计数 ───────────────────────────────────────────────
+        if action in ("hold", "skip", "adjust_sl_tp"):
             self._consecutive_hold += 1
             _ai_wait = int(decision.get("wait_seconds", -1))  # -1 = AI 未给出
-            self._ai_hold_wait = max(0, min(300, _ai_wait)) if _ai_wait >= 0 else -1
+            self._ai_hold_wait = max(15, min(90, _ai_wait)) if _ai_wait >= 0 else 15
         else:
             self._consecutive_hold = 0
             self._ai_hold_wait = -1  # 重置为"未给出"，下次由 AI 重新决定
@@ -3996,7 +4242,7 @@ def main():
     )
     log.info("🤖 ETH Trader 启动中...")
     bot = ETHTrader(ai_client)
-    log.info("✅ ETH Trader 已启动（DeepSeek 主决策 + Qwen 仲裁）")
+    log.info("✅ ETH Trader 已启动（DeepSeek 主决策 + Qwen 仲裁/趋势补漏）")
     bot.run()
 
 
