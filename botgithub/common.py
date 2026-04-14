@@ -25,7 +25,7 @@ import socket
 import websocket
 from dotenv import load_dotenv
 from openai import OpenAI
-from prometheus_client import Gauge, generate_latest, CollectorRegistry, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Gauge, generate_latest, CollectorRegistry, CONTENT_TYPE_LATEST
 
 load_dotenv()
 
@@ -138,7 +138,6 @@ def log_kelly_metrics(sym: str, p_win: float, b: float, kelly_f: float,
                       risk_mult: float, slippage_mult: float,
                       final_risk: float, risk_budget: float,
                       size: int, price: float, decision_id: int,
-                      committee_opposing: int = 0,
                       market_mode: str = "",
                       posterior_confidence: float = 0.5,
                       kelly_fraction: float = 0.5,
@@ -168,7 +167,6 @@ def log_kelly_metrics(sym: str, p_win: float, b: float, kelly_f: float,
         "size": size,
         "price": round(price, 4),
         "decision_id": decision_id,
-        "committee_opposing": committee_opposing,
         "market_mode": market_mode,
         "posterior_confidence": round(posterior_confidence, 4),
         "expected_slippage_bp": expected_slippage_bp,
@@ -390,41 +388,42 @@ def get_all_pending_orders() -> List[Dict]:
 def update_trade_close(trade_id: int, exit_price: float, close_reason: str = "",
                        leverage: int = 1, pnl: float = None, pnl_pct: float = None,
                        fail_reason: str = None):
-    """更新交易平仓信息（含 close_ts、pnl 回填）"""
+    """更新交易平仓信息（PNL 计算同步，UPDATE 异步写入，解除主线程 I/O 阻塞）"""
     close_ts = datetime.now(UTC).isoformat()
-    for attempt in range(3):
+    # ── PNL 计算（需同步读 DB）────────────────────────────────────────────
+    _pnl = pnl
+    _pnl_pct = pnl_pct
+    if _pnl is None and exit_price > 0:
         try:
             conn = get_db_conn()
-            # 若调用方未传 pnl，根据 entry/exit/side 自动计算（防止 pnl=NULL 的幸存者偏差）
-            _pnl = pnl
-            _pnl_pct = pnl_pct
-            if _pnl is None and exit_price > 0:
-                c = conn.cursor()
-                c.execute("SELECT side, entry FROM trades WHERE id=?", (trade_id,))
-                row = c.fetchone()
-                if row and row[1] and row[1] > 0:
-                    side, entry = row
-                    if side == "long":
-                        _pnl_pct = (exit_price - entry) / entry
-                    elif side == "short":
-                        _pnl_pct = (entry - exit_price) / entry
-                    if _pnl_pct is not None:
-                        _pnl = _pnl_pct * leverage  # 含杠杆的实际盈亏比例
-                        log.debug(f"[DB] trade#{trade_id} pnl 自动回填: side={side} entry={entry:.2f} exit={exit_price:.2f} pnl_pct={_pnl_pct*100:.2f}%")
-            if _pnl is not None:
-                conn.execute(
-                    "UPDATE trades SET exit=?, close_ts=?, close_reason=?, pnl=?, pnl_pct=? WHERE id=?",
-                    (exit_price, close_ts, close_reason, _pnl, _pnl_pct, trade_id))
-            else:
-                conn.execute(
-                    "UPDATE trades SET exit=?, close_ts=?, close_reason=? WHERE id=?",
-                    (exit_price, close_ts, close_reason, trade_id))
-            conn.commit()
-            return
+            c = conn.cursor()
+            c.execute("SELECT side, entry FROM trades WHERE id=?", (trade_id,))
+            row = c.fetchone()
+            if row and row[1] and row[1] > 0:
+                side, entry = row
+                if side == "long":
+                    _pnl_pct = (exit_price - entry) / entry
+                elif side == "short":
+                    _pnl_pct = (entry - exit_price) / entry
+                if _pnl_pct is not None:
+                    _pnl = _pnl_pct * leverage
+                    log.debug(f"[DB] trade#{trade_id} pnl 自动回填: side={side} entry={entry:.2f} exit={exit_price:.2f} pnl_pct={_pnl_pct*100:.2f}%")
         except Exception as e:
-            if "locked" in str(e) and attempt < 2:
-                time.sleep(0.5); continue
-            log.exception(f"update_trade_close 写入失败: {e}")
+            log.debug(f"[DB] trade#{trade_id} PNL 计算失败（继续写入）: {e}")
+
+    # ── UPDATE 异步写入（消除主线程阻塞）────────────────────────────────────
+    if _pnl is not None:
+        sql = ("UPDATE trades SET exit=?, close_ts=?, close_reason=?, pnl=?, pnl_pct=? WHERE id=?")
+        params = (exit_price, close_ts, close_reason, _pnl, _pnl_pct, trade_id)
+    else:
+        sql = ("UPDATE trades SET exit=?, close_ts=?, close_reason=? WHERE id=?")
+        params = (exit_price, close_ts, close_reason, trade_id)
+
+    _async_failed = get_db_manager().write(sql, params)
+    if not _async_failed:
+        # 异步队列满时降级同步写入，确保交易记录不丢
+        log.warning(f"[DB] 交易记录异步写入失败，降级同步写入 trade_id={trade_id}")
+        get_db_manager().write_sync(sql, params)
 
 # ============================================================
 # Win Rate 查询
@@ -444,7 +443,6 @@ def generate_fail_reason_async(trade_id: int, ai_client, context: str):
 def _generate_fail_reason_worker(trade_id: int, ai_client, context: str):
     """失败原因生成的工作线程"""
     try:
-        from common import _call_reasoner
         prompt = f"""分析以下交易失败的潜在原因：
 
 {context}
@@ -604,28 +602,23 @@ bot_instance = _BotInstanceProxy()
 # 决策记录写入
 # ============================================================
 def save_decision_to_db(decision: Dict, price: float, balance: float, features: Dict,
-                        slippage_pct: float = 0.0, symbol: str = "ETH-USDT-SWAP") -> Optional[int]:
-    try:
-        conn = get_db_conn()
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO decisions
-            (symbol, ts, thought_process, action, confidence, suggested_sl, suggested_tp,
-             reason, price, balance, features, slippage_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            symbol, datetime.now(UTC).isoformat(),
-            decision.get("thought_process", "")[:500],
-            decision.get("action"), decision.get("confidence", 0.0),
-            decision.get("suggested_sl", 0.0), decision.get("suggested_tp", 0.0),
-            decision.get("reason", ""),
-            price, balance, json.dumps(features, ensure_ascii=False), slippage_pct
-        ))
-        conn.commit()
-        return c.lastrowid
-    except Exception as e:
-        log.exception(f"决策写入失败: {e}")
-        return None
+                        slippage_pct: float = 0.0, symbol: str = "ETH-USDT-SWAP") -> None:
+    """AI 决策记录写入（异步，解除主线程 I/O 阻塞）"""
+    sql = '''
+        INSERT INTO decisions
+        (symbol, ts, thought_process, action, confidence, suggested_sl, suggested_tp,
+         reason, price, balance, features, slippage_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    '''
+    params = (
+        symbol, datetime.now(UTC).isoformat(),
+        decision.get("thought_process", "")[:500],
+        decision.get("action"), decision.get("confidence", 0.0),
+        decision.get("suggested_sl", 0.0), decision.get("suggested_tp", 0.0),
+        decision.get("reason", ""),
+        price, balance, json.dumps(features, ensure_ascii=False), slippage_pct
+    )
+    get_db_manager().write(sql, params)
 
 def save_trade_open(decision_id: Optional[int], side: str, size: float, entry: float,
                     symbol: str = "ETH-USDT-SWAP") -> Optional[int]:
@@ -692,10 +685,6 @@ def _webhook_worker():
                     _webhook_consecutive_failures = 0
         finally:
             _webhook_queue.task_done()
-
-def _send_webhook(msg: str, data: str = "", level: int = 1):
-    """已废弃，使用 _notify 代替"""
-    pass
 
 def _webhook(msg: str, data: str = "", level: int = 1):
     """兼容性别名 - 将 (msg, data, level) 转为 (title, content) 格式"""
@@ -870,6 +859,10 @@ consecutive_slippage_gauge = Gauge('consecutive_slippage', 'Number of consecutiv
 ai_request_count = Gauge('ai_request_total', 'Total number of AI requests', registry=REGISTRY)
 slippage_avg_gauge = Gauge('slippage_avg_pct', 'Average slippage percentage over last N trades', registry=REGISTRY)
 open_positions_gauge = Gauge('open_positions', 'Number of currently open positions', registry=REGISTRY)
+db_queue_size_gauge = Gauge('db_write_queue_size', 'Current size of DB write queue', registry=REGISTRY)
+ai_cache_query_counter = Counter('ai_cache_query_total', 'Total AI cache queries', registry=REGISTRY)
+ai_cache_hit_counter = Counter('ai_cache_hit_total', 'AI cache hits', registry=REGISTRY)
+ai_cache_miss_counter = Counter('ai_cache_miss_total', 'AI cache misses', registry=REGISTRY)
 
 _health_data: dict = {
     "status":       "starting",
@@ -957,6 +950,119 @@ def _parse_tg_url(url: str) -> tuple:
     if m:
         return m.group(1), m.group(2)
     return None, None
+
+
+def _build_stats_report() -> str:
+    """从 trades 表构建量化指标统计报告。"""
+    try:
+        conn = get_db_conn()
+        rows = conn.execute(
+            "SELECT open_ts, close_ts, side, pnl_pct, close_reason "
+            "FROM trades WHERE pnl_pct IS NOT NULL ORDER BY close_ts DESC LIMIT 200"
+        ).fetchall()
+    except Exception as e:
+        return f"⚠️ 数据库查询失败: {e}"
+
+    if not rows:
+        return "📊 暂无已平仓交易记录"
+
+    # 反转使 oldest→newest（pnl_pct 正=盈利，负=亏损）
+    trades = list(reversed(rows))
+    n = len(trades)
+
+    # ── 基础统计 ──────────────────────────────────────────────
+    pnls = [float(r[3]) for r in trades]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    win_count = len(wins)
+    loss_count = len(losses)
+    win_rate = win_count / n if n else 0
+    avg_win = sum(wins) / win_count if wins else 0
+    avg_loss = sum(losses) / loss_count if losses else 0
+    total_pnl = sum(pnls)
+    profit_factor = sum(wins) / abs(sum(losses)) if losses else float('inf')
+
+    # ── 最大连续亏损 ──────────────────────────────────────────
+    max_consec = cur = 0
+    for p in pnls:
+        if p <= 0:
+            cur += 1
+            max_consec = max(max_consec, cur)
+        else:
+            cur = 0
+
+    # ── 持仓时长 ──────────────────────────────────────────────
+    durations = []
+    for r in trades:
+        try:
+            t_open = _parse_dt(r[0])
+            t_close = _parse_dt(r[1])
+            if t_open and t_close:
+                durations.append((t_close - t_open).total_seconds() / 60)
+        except Exception:
+            pass
+    avg_hold_min = sum(durations) / len(durations) if durations else 0
+    max_hold_min = max(durations) if durations else 0
+    min_hold_min = min(durations) if durations else 0
+
+    # ── 近 20 笔趋势（胜率移动窗口）────────────────────────────
+    window = 20
+    recent_wr = sum(1 for p in pnls[-window:] if p > 0) / min(window, n) if n else 0
+
+    # ── 时段胜率（按开仓小时 UTC）─────────────────────────────
+    hour_stats: dict[int, list] = {}
+    for r in trades:
+        try:
+            t_open = _parse_dt(r[0])
+            if t_open:
+                h = t_open.hour
+                hour_stats.setdefault(h, []).append(float(r[3]))
+        except Exception:
+            pass
+
+    hour_lines = []
+    for h in sorted(hour_stats):
+        hp = hour_stats[h]
+        hw = sum(1 for p in hp if p > 0)
+        hr = hw / len(hp)
+        havg = sum(hp) / len(hp)
+        label = f"{h:02d}:00"
+        bar = "█" * int(hr * 10) + "░" * (10 - int(hr * 10))
+        hour_lines.append(f"  `{label}` 胜率{hr:.0%} 均盈亏{havg:+.1f}% {bar}")
+
+    lines = [
+        "📊 *量化指标统计*（共 {n} 笔）\n\n".format(n=n),
+        f"🏆 胜率: `{win_rate:.1%}` ({win_count}W/{loss_count}L)\n",
+        f"📈 盈亏比: `{profit_factor:.2f}`\n",
+        f"💰 平均盈利: `+{avg_win:.2f}%` | 平均亏损: `{avg_loss:+.2f}%`\n",
+        f"📉 最大连续亏损: `{max_consec} 次`\n",
+        f"⏱️ 平均持仓: `{avg_hold_min:.0f}min`（最短{min_hold_min:.0f}/最长{max_hold_min:.0f}）\n",
+        f"📈 近{window}笔胜率: `{recent_wr:.0%}`\n",
+    ]
+
+    if hour_lines:
+        lines.append(f"\n🕐 *时段胜率*（UTC，按开仓时间）:\n")
+        # 只显示有交易且超过 3 笔的时段
+        active_hours = [h for h in sorted(hour_stats) if len(hour_stats[h]) >= 3]
+        if active_hours:
+            for h in active_hours:
+                hp = hour_stats[h]
+                hw = sum(1 for p in hp if p > 0)
+                hr = hw / len(hp)
+                havg = sum(hp) / len(hp)
+                label = f"{h:02d}:00"
+                bar = "█" * int(hr * 10) + "░" * (10 - int(hr * 10))
+                lines.append(f"  `{label}` 胜率{hr:.0%}({len(hp)}笔) 均{havg:+.1f}% {bar}\n")
+        else:
+            lines.append("  数据不足（每时段至少 3 笔）\n")
+
+    # ── 警示 ──────────────────────────────────────────────────
+    if profit_factor < 1.2 and n >= 10:
+        lines.append(f"\n⚠️ 盈亏比 `{profit_factor:.2f} < 1.2`，策略期望值偏低")
+    if win_rate < 0.40 and n >= 10:
+        lines.append(f"\n⚠️ 胜率 `{win_rate:.0%} < 40%`，建议检查开仓质量")
+
+    return "".join(lines)
 
 
 def _tg_poll_commands():
@@ -1097,10 +1203,14 @@ def _tg_poll_commands():
                     else:
                         send("❌ 无法获取 bot 实例")
 
+                elif cmd == "/stats":
+                    send(_build_stats_report())
+
                 elif cmd == "/help":
                     send(
                         "🤖 *可用指令*\n"
                         "/status — 当前持仓和今日盈亏\n"
+                        "/stats — 量化指标统计（胜率/盈亏比/持仓时长/时段分析）\n"
                         "/pending — 待审批参数变更\n"
                         "/approve\\_N — 审批第N条变更\n"
                         "/reject\\_N — 拒绝第N条变更\n"
@@ -2016,10 +2126,11 @@ def _parse_llm_json_array(raw_text: str) -> list:
     """
     cleaned = _clean_json_text(raw_text)
     # 剥离 <think>...</think> 包裹（Reasoner 输出结构）
+    _think_tag = "</think>"
     _think_s = cleaned.find("████")
-    _think_e = cleaned.find("</think>")
+    _think_e = cleaned.find(_think_tag)
     if _think_s != -1 and _think_e != -1 and _think_e > _think_s:
-        cleaned = cleaned[_think_e + 8:].strip()
+        cleaned = cleaned[_think_e + len(_think_tag):].strip()
 
     # 步骤2：先尝试整段直接 parse
     try:
@@ -2163,7 +2274,18 @@ class DatabaseManager:
                     except Exception as db_e:
                         log.error(f"DB写入异常: {db_e} | SQL: {sql[:80]}")
                         break
+                # 更新队列大小指标
+                current_size = self._write_queue.qsize()
+                db_queue_size_gauge.set(current_size)
+                # 队列积压超过 80% 时告警
+                maxsize = self._write_queue.maxsize
+                if maxsize > 0 and current_size >= maxsize * 0.8:
+                    log.warning(
+                        f"⚠️ DB写队列积压 {current_size}/{maxsize} (≥80%)，"
+                        f"可能存在写入瓶颈或磁盘问题"
+                    )
             except queue.Empty:
+                db_queue_size_gauge.set(0)
                 pass
             except Exception as e:
                 log.warning(f"DB写线程顶层异常: {e}")
@@ -2171,10 +2293,15 @@ class DatabaseManager:
     def write(self, sql: str, params: tuple = ()) -> bool:
         import queue
         try:
-            self._write_queue.put_nowait((sql, params))
+            self._write_queue.put((sql, params), timeout=2.0)
+            db_queue_size_gauge.set(self._write_queue.qsize())
             return True
         except queue.Full:
-            log.warning(f"DB写队列满，跳过: {sql[:50]}")
+            log.warning(f"DB写队列满（等待2秒后仍满），丢弃: {sql[:50]}")
+            db_queue_size_gauge.set(self._write_queue.qsize())
+            return False
+        except Exception as e:
+            log.error(f"DB写入队列异常: {e}")
             return False
 
     def write_sync(self, sql: str, params: tuple = (), max_retries: int = 3) -> bool:
@@ -2267,6 +2394,13 @@ class PositionManager:
                     old = self._pos.peak_price
                     self._pos.peak_price = new_peak
                     log.debug(f"[PosMgr] UPDATE_PEAK | {old:.4f} → {new_peak:.4f} | src={src}")
+
+                # 新增：支持 trailing_activate_ts（防止"边激活边触发"）
+                activate_ts = p.get("trailing_activate_ts")
+                if activate_ts is not None:
+                    self._pos.trailing_activate_ts = activate_ts
+                    log.debug(f"[PosMgr] TRAILING_ACTIVATE_TS → {activate_ts:.1f} | src={src}")
+
                 active = p.get("trailing_active")
                 if active is not None:
                     self._pos.trailing_active = active
