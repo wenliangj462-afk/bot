@@ -125,6 +125,8 @@ class Position:
     exit_bb_pct:       float          = 0.0
     exit_atr_pct:      float          = 0.0
     exit_market_mode:  Optional[str]  = None
+    trailing_activate_ts: float       = 0.0   # 追踪止损激活时间戳（防止"边激活边触发"）
+    ladder_level:        int          = 0     # 阶梯盈利锁当前层级（0=未触发）
 
 # ============================================================
 # 信号层统一输出对象
