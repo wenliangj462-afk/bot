@@ -8,16 +8,25 @@ import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
 
-# ── 共享基础设施（common.py）──────────────────────────────────────────────
-from common import (
-    CFG, log, _webhook, gs_get, gs_set, gs_increment, gs_update,
-    UTC, log_event, get_pending_order_by_id, delete_pending_order,
-    get_all_pending_orders,
-)
-# ── 数据模型（core.py）──────────────────────────────────────────────────
-from core import GLOBAL_STATE, PositionIntent, PositionIntentType, save_state_to_disk
+# ── 配置单例（直接从 config 打破循环）────────────────────────────────────
+from config import CFG
+# ── 全局状态函数（直接从 core 打破循环）──────────────────────────────────
+from core import gs_get, gs_set, gs_increment, gs_update, UTC, \
+    PositionIntent, PositionIntentType, save_state_to_disk
+# ── 共享工具（直接导入，不走 common 避免循环）─────────────────────────────
+from common import log, _webhook, log_event, \
+    get_pending_order_by_id, delete_pending_order, get_all_pending_orders
 # ── market_data ───────────────────────────────────────────────────────
 from market import fetch_market_sentiment_data
+
+# ── 阶梯盈利锁配置（统一 R 标尺，取代 moved_stop / 1.5R / 2.5R）──────────
+_LADDER_R_LEVELS          = [0.8, 1.5, 2.5, 3.5]    # L1~L4 触发点（基于初始SL距离）
+_LADDER_LOCK_R            = [0.0, 0.3, 0.8, 1.5]    # 各档锁利润（R），L1=0.0R=保本
+_MULTI_CLOSE_PCT            = [0.20, 0.15, 0.15, 0.20]  # 多张各档平仓比例
+_OSC_AGGRESSIVE_ADD_R       = 0.25                    # 震荡市每档额外锁利
+_VSPIKE_SAME_SIDE_MULT      = 8.0                     # 同向VSpike≥8x 加持阈值
+_VSPIKE_REV_FORCE_MULT      = 8.0                     # 反向VSpike≥8x 强制逃生（AI评估）
+_VSPIKE_EXTREME_ESCAPE      = 10.0                    # 反向VSpike≥10x 核按钮全平
 
 # ── 辅助函数 ─────────────────────────────────────────────────────────────
 def dynamic_kelly_mult(drawdown_pct: float, win_rate: float, market_mode: str) -> float:
@@ -35,12 +44,12 @@ def dynamic_kelly_mult(drawdown_pct: float, win_rate: float, market_mode: str) -
         dd_mult = max(0.20, 1.0 - (drawdown_pct - 0.02) * 8)
 
     # 因子2：胜率（min_sample=8 已保证 win_rate 有意义）
-    if win_rate < 0.40:
-        wr_mult = 0.75
+    if win_rate < 0.35:
+        wr_mult = 0.82  # 放宽门槛，连亏期保留更多风险预算
     elif win_rate > 0.60:
         wr_mult = 1.15
     else:
-        wr_mult = 0.75 + (win_rate - 0.40) / 0.20 * 0.40  # 线性插值 0.75→1.15
+        wr_mult = 0.82 + (win_rate - 0.35) / 0.25 * 0.33  # 线性插值 0.82→1.15
 
     # 因子3：市场模式
     mode_mult = 1.12 if market_mode == "趋势" else 1.0
@@ -204,7 +213,10 @@ class RiskGuard:
                                     log.warning(f"⚠️ 幽灵仓位清理：撤销算法单失败: {_algo_e}")
                                 log.error(f"👻 [{CFG.symbol}] 幽灵仓位检测：本地持仓{side}但交易所无持仓，尝试平仓清除")
                                 _webhook("👻 幽灵仓位", f"[{CFG.symbol}] 本地持仓{side}但交易所无持仓，尝试平仓")
+                                # _close 采用三阶段锁设计：快照（持锁）→ I/O（无锁）→ 写回（持锁）
+                                # 因此此处调用无需担心与风控主循环的死锁问题。
                                 self.trader.position_exec._close("幽灵仓位清除", symbol=CFG.symbol)
+                                self.trader._ai_close_pending_until = time.monotonic() + 5.0
                                 time.sleep(CFG.risk_check_interval)
                                 continue
                             else:
@@ -218,6 +230,8 @@ class RiskGuard:
                                     # 不一致：强制同步本地状态
                                     log.warning(f"⚠️ [{CFG.symbol}] 本地仓位与交易所不一致 "
                                                  f"(side:{side}→{exch_side} size:{size}→{exch_size} liq:{liq:.2f}→{exch_liq:.2f})")
+                                    # sync_position 采用锁外 I/O + 锁内状态写回设计，是安全的。
+                                    # 同步后重新读取 self.trader.pos 获取最新值。
                                     self.trader.state.sync_position(CFG.symbol)
                                     liq = self.trader.pos.liq_price if self.trader.pos.liq_price > 0 else liq
                                     size = self.trader.pos.size if self.trader.pos.size > 0 else size
@@ -227,6 +241,52 @@ class RiskGuard:
                     except Exception as e:
                         log.warning(f"[{CFG.symbol}] 状态检测异常（将10s后重试）: {e}")
 
+                # ── VSpike 反向紧急逃生（分层：8x~10x 常规逃生，≥10x 核按钮）───
+                _vs_status = self.trader.vspike.get_status()
+                _vs_mult_r = _vs_status.get("mult", 0)
+                _vs_dir_r = _vs_status.get("direction", "均衡")
+                _spike_rev = (
+                    _vs_mult_r >= _VSPIKE_REV_FORCE_MULT and (
+                        (side == "long" and "卖方主导" in _vs_dir_r) or
+                        (side == "short" and "买方主导" in _vs_dir_r)
+                    )
+                )
+                if _spike_rev:
+                    if _vs_mult_r >= _VSPIKE_EXTREME_ESCAPE:
+                        # ≥10x 核按钮：跳过 AI 评估，直接市价全平
+                        log.critical(
+                            f"💥 [{CFG.symbol}] VSpike核按钮逃生！{_vs_mult_r:.1f}x {_vs_dir_r} "
+                            f"vs 持仓{side}，跳过AI直接全平"
+                        )
+                        _webhook("💥 VSpike核按钮",
+                                 f"[{CFG.symbol}] {_vs_mult_r:.1f}x {_vs_dir_r} vs {side}，核按钮全平")
+                        log_event("vspike_extreme_escape", {
+                            "sym": CFG.symbol, "side": side,
+                            "vspike_mult": _vs_mult_r, "vspike_dir": _vs_dir_r,
+                            "trigger": "nuclear_button"
+                        })
+                        self.trader.position_exec._close(f"VSpike核按钮逃生({_vs_mult_r:.0f}x)", symbol=CFG.symbol)
+                        self.trader._ai_close_pending_until = time.monotonic() + 5.0
+                        time.sleep(CFG.risk_check_interval)
+                        continue
+                    else:
+                        # 8x~10x：量能极大但仍需方向确认，直接平仓止损
+                        log.critical(
+                            f"🚨 [{CFG.symbol}] VSpike反向紧急逃生！{_vs_mult_r:.1f}x {_vs_dir_r} "
+                            f"vs 持仓{side}，强制全平"
+                        )
+                        _webhook("🚨 VSpike反向逃生",
+                                 f"[{CFG.symbol}] {_vs_mult_r:.1f}x {_vs_dir_r} vs {side}，全平")
+                        log_event("vspike_reverse_escape", {
+                            "sym": CFG.symbol, "side": side,
+                            "vspike_mult": _vs_mult_r, "vspike_dir": _vs_dir_r,
+                            "trigger": "direct_close"
+                        })
+                        self.trader.position_exec._close(f"VSpike反向逃生({_vs_mult_r:.0f}x)", symbol=CFG.symbol)
+                        self.trader._ai_close_pending_until = time.monotonic() + 5.0
+                        time.sleep(CFG.risk_check_interval)
+                        continue
+
                 # 硬止损
                 if pnl_pct <= -CFG.hard_stop_loss_pct:
                     log_event("hard_stop_close", {
@@ -235,6 +295,7 @@ class RiskGuard:
                         "threshold": CFG.hard_stop_loss_pct
                     })
                     self.trader.position_exec._close("硬止损触发", symbol=CFG.symbol)
+                    self.trader._ai_close_pending_until = time.monotonic() + 5.0
                     time.sleep(CFG.risk_check_interval)
                     continue
 
@@ -252,6 +313,7 @@ class RiskGuard:
                     if dist_pct < 0:
                         log.critical(f"💥 [{CFG.symbol}] 已被强平！标记价={mark_price:.4f} 强平价={liq:.4f}")
                         self.trader.position_exec._close("强平触发", symbol=CFG.symbol)
+                        self.trader._ai_close_pending_until = time.monotonic() + 5.0
                         time.sleep(CFG.risk_check_interval)
                         continue
 
@@ -262,6 +324,7 @@ class RiskGuard:
                             self.trader._liq_warn_ts = time.monotonic()
                             log.warning(f"⚠️ [{CFG.symbol}] 强平预警！标记价={mark_price:.4f} 距强平={dist_pct*100:.2f}%")
                             self.trader.position_exec._close("强平预警自动减仓", symbol=CFG.symbol)
+                            self.trader._ai_close_pending_until = time.monotonic() + 5.0
                         time.sleep(CFG.risk_check_interval)
                         continue
 
@@ -391,6 +454,7 @@ class RiskGuard:
                             f" ≥ {_eff_ts}分钟（{market_mode_trailing}，配置={CFG.time_stop_minutes}分钟）"
                         )
                         self.trader.position_exec._close(f"超时平仓({market_mode_trailing},{_eff_ts}min)", symbol=CFG.symbol)
+                        self.trader._ai_close_pending_until = time.monotonic() + 5.0
                         time.sleep(CFG.risk_check_interval)
                         continue
 
@@ -440,59 +504,31 @@ class RiskGuard:
                     if force_close_reason:
                         log.warning(f"🚨 [{CFG.symbol}] 强制平仓触发: {force_close_reason}")
                         self.trader.position_exec._close(force_close_reason, symbol=CFG.symbol)
+                        self.trader._ai_close_pending_until = time.monotonic() + 5.0
                         time.sleep(CFG.risk_check_interval)
                         continue
                 except Exception as force_e:
                     log.debug(f"强制平仓检测异常: {force_e}")
 
-                # 移动止损优化（盈利后移至成本+0.5R）
-                if not moved_stop and pnl_pct >= 0.01:  # 盈利≥1%
-                    if (side == "long" and sl < entry) or (side == "short" and sl > entry):
-                        # 计算1R距离 = abs(entry - sl)
-                        risk_dist = abs(entry - sl) if sl > 0 else 0
-                        if risk_dist > 0:
-                            new_sl = entry + 0.5 * risk_dist if side == "short" else entry - 0.5 * risk_dist
-                            with lock:
-                                pos.stop_loss = new_sl
-                                pos.moved_stop = True
-                            save_state_to_disk(pos)
-                            sz_str = str(max(1, int(size)))
-                            be_ok = self.okx.update_algo_orders(side, sz_str, new_sl, tp, symbol=CFG.symbol)
-                            if be_ok:
-                                log.debug(f"🛡️ [{CFG.symbol}] 移动止损至成本+0.5R: {new_sl:.4f}")
-                            else:
-                                log.error(f"❌ [{CFG.symbol}] 移动止损挂单失败！")
-                        else:
-                            # 若无止损，直接设为成本
-                            with lock:
-                                pos.stop_loss = entry
-                                pos.moved_stop = True
-                            save_state_to_disk(pos)
-                            sz_str = str(max(1, int(size)))
-                            be_ok = self.okx.update_algo_orders(side, sz_str, entry, tp, symbol=CFG.symbol)
-                            if be_ok:
-                                log.debug(f"🛡️ [{CFG.symbol}] 保本止损已强制设置={entry:.4f}")
+                # ── 阶梯盈利锁（统一R标尺，取代 moved_stop / 1.5R / 2.5R）────────
+                sl_dist_pct = abs(entry - sl) / entry if sl > 0 and entry > 0 else 0
+                if sl_dist_pct > 0:
+                    self._profit_ladder_lock(
+                        price, sl, entry, side, size, pnl_pct, sl_dist_pct,
+                        _LADDER_R_LEVELS, _LADDER_LOCK_R, _MULTI_CLOSE_PCT,
+                        _OSC_AGGRESSIVE_ADD_R, market_mode_trailing
+                    )
 
-                # 1.5R 分批止盈（持仓≥2张时）：平25%仓位 + SL移至0.5R（成本以下，给正常波动留空间）
-                # 2.5R 再平25%：多级分批止盈（需配合 partial_tp_2_5R_triggered 标记）
-                _tp_2_5R_close_pct = 0.25   # 每次平25%（从30%降低，让趋势延续时赚更多）
-                _sl_move_r = 0.50             # SL移至成本以下0.5R（从0.3R放宽，防止正常波动扫掉剩余仓位）
-                _tp_tighten_r = 2.00          # ADX<20震荡市：TP收紧至2.0R（从1.8R放宽）
-                _tp_cool_seconds = 600         # 10分钟TP调整冷却
-
-                # 读取ADX和当前TP用于ADX规则判断
+                # ── 规则化风控：ADX<20震荡市收紧TP至2.0R（双保险，不依赖AI）────────
+                _tp_tighten_r = CFG.trend_tp_tighten_r
+                tp_dist_pct = abs(tp - entry) / entry if tp > 0 and entry > 0 else 0
                 _cached = self.trader._ind_15m_cache
                 _, _ind_cached, _ = _cached
                 adx_15m = _ind_cached.get("adx", 25)
-                market_mode_tp = self.trader._market_mode
-                tp_dist_pct = abs(tp - entry) / entry if tp > 0 and entry > 0 else 0
-                sl_dist_pct = abs(entry - sl) / entry if sl > 0 and entry > 0 else 0
-
-                # ── 规则化风控：ADX<20震荡市收紧TP至2.0R（双保险，不依赖AI）────────
-                # 修复：已触发1.5R分批止盈后不执行TP收紧（让剩余仓位自由运行到原始TP）
-                if (market_mode_tp == "震荡" and adx_15m < 20
+                if (market_mode_trailing == "震荡" and adx_15m < 20
                         and tp > 0 and entry > 0 and tp_dist_pct > sl_dist_pct * _tp_tighten_r
                         and not partial_tp_triggered):
+                    _tp_cool_seconds = 600
                     last_adj = self.trader._last_adjust_time
                     if (datetime.now(UTC) - last_adj).total_seconds() > _tp_cool_seconds:
                         new_tp = entry + _tp_tighten_r * abs(entry - sl) if side == "long" else entry - _tp_tighten_r * abs(entry - sl)
@@ -505,139 +541,6 @@ class RiskGuard:
                         if ok:
                             log.warning(f"🛡️ [{CFG.symbol}] ADX={adx_15m:.1f}<20震荡市，TP从{tp:.4f}收紧至{new_tp:.4f}(2.0R)")
                         _webhook("🛡️ TP自动收紧", f"[{CFG.symbol}] ADX={adx_15m:.1f}震荡市，TP→{new_tp:.4f}")
-
-                # ── 1.5R 分批止盈：平25% + SL移至0.5R ─────────────────────────────
-                # 修复：size >= 1 即可触发（1 张仓位也享受分批止盈保护）
-                if (size >= 1 and not partial_tp_triggered
-                        and sl > 0 and entry > 0):
-                    # 1.5R触发：盈利达到止损距离的1.5倍
-                    if pnl_pct >= sl_dist_pct * 1.5:
-                        close_sz = max(1, int(size * 0.25))   # 平25%
-                        # ── P0 Fix: 仓位≤close_sz时无法分批，只收紧SL ──────────
-                        # 修复: size=1时 close_sz=1 会全平→幽灵仓位→残留算法单杀新仓
-                        if close_sz >= int(size):
-                            log.info(f"🛡️ [{CFG.symbol}] 盈利达1.5R({pnl_pct*100:.2f}%)，"
-                                     f"仓位仅{int(size)}张无法分批，仅收紧SL到成本附近")
-                            with lock:
-                                if side == "long":
-                                    new_sl = entry - _sl_move_r * abs(entry - sl)
-                                else:
-                                    new_sl = entry + _sl_move_r * abs(entry - sl)
-                                pos.stop_loss = new_sl
-                                partial_tp_triggered = True
-                                pos.partial_tp_triggered = True
-                                breakeven_triggered = True
-                                pos.breakeven_triggered = True
-                            save_state_to_disk(pos)
-                            _sz_str = str(int(size))
-                            algo_ok = self.okx.update_algo_orders(
-                                side, _sz_str, new_sl, tp, symbol=CFG.symbol)
-                            self.trader._last_adjust_time = datetime.now(UTC)
-                            if algo_ok:
-                                log.warning(f"🛡️ [{CFG.symbol}] 1.5R保护(仅{int(size)}张)，"
-                                            f"SL移至{new_sl:.4f}(0.3R成本以下)")
-                            else:
-                                log.error(f"❌ [{CFG.symbol}] 1.5R SL收紧失败！")
-                                _webhook("❌ 算法单更新失败",
-                                         f"[{CFG.symbol}] 1.5R SL收紧失败，SL={new_sl:.4f}")
-                            _webhook("🛡️ 1.5R SL保护",
-                                     f"[{CFG.symbol}] 仅{int(size)}张无法分批，SL→{new_sl:.4f}")
-                        else:
-                            # ── 正常分批止盈（size≥2） ─────────────────────────
-                            log.debug(f"🎯 [{CFG.symbol}] 盈利达1.5R({pnl_pct*100:.2f}%)，分批止盈 {close_sz}张(25%)")
-                            try:
-                                close_side = "sell" if side == "long" else "buy"
-                                # 注：风控线程直接发起市价平仓，不经过 position_exec（紧急平仓逻辑）
-                                close_res  = self.okx._request(
-                                    "POST", "/api/v5/trade/order",
-                                    body_data={"instId": CFG.symbol, "tdMode": "isolated",
-                                               "side": close_side, "posSide": side,
-                                               "ordType": "market", "sz": str(close_sz),
-                                               "reduceOnly": "true"}
-                                )
-                                if close_res.get("code") == "0":
-                                    sz_remain_1r = max(1, int(size - close_sz))
-                                    # 锁内只做内存状态计算和状态持久化
-                                    with lock:
-                                        partial_tp_triggered = True
-                                        pos.partial_tp_triggered = True
-                                        breakeven_triggered = True
-                                        pos.breakeven_triggered = True
-                                        pos.size = sz_remain_1r
-                                        if side == "long":
-                                            new_sl = entry - _sl_move_r * abs(entry - sl)
-                                        else:
-                                            new_sl = entry + _sl_move_r * abs(entry - sl)
-                                        pos.stop_loss = new_sl
-                                    save_state_to_disk(pos)
-                                    # 锁外才发起网络API调用，遵守"持锁期间禁止网络IO"规则
-                                    _sz_for_algo = str(sz_remain_1r)
-                                    _sl_for_algo = new_sl
-                                    sz_remain = _sz_for_algo
-                                    new_sl = _sl_for_algo
-                                    algo_ok = self.okx.update_algo_orders(side, sz_remain, new_sl, tp, symbol=CFG.symbol)
-                                    self.trader._last_adjust_time = datetime.now(UTC)
-                                    if algo_ok:
-                                        log.warning(f"🛡️ [{CFG.symbol}] 1.5R分批平{close_sz}张，SL移至{new_sl:.4f}(0.3R成本以下)")
-                                    else:
-                                        log.error(f"❌ [{CFG.symbol}] 1.5R分批后更新算法单失败！")
-                                        _webhook("❌ 算法单更新失败", f"[{CFG.symbol}] 1.5R分批后SL挂单失败，SL={new_sl:.4f}，请手动设置")
-                                    _webhook("🎯 1.5R分批止盈", f"[{CFG.symbol}] 平{close_sz}张(25%)，剩余SL=0.5R({new_sl:.4f})")
-                                else:
-                                    log.error(f"❌ [{CFG.symbol}] 1.5R分批止盈失败: {close_res.get('msg', '')}")
-                            except Exception as e:
-                                log.error(f"[{CFG.symbol}] 1.5R分批止盈异常: {e}")
-
-                # ── 2.5R 再平25%：多级分批止盈 ─────────────────────────────────
-                if (size >= 1 and not partial_tp_2_5R_triggered
-                        and sl > 0 and entry > 0):
-                    # 2.5R触发：盈利达到止损距离的2.5倍
-                    if pnl_pct >= sl_dist_pct * 2.5:
-                        close_sz = max(1, int(size * _tp_2_5R_close_pct))
-                        log.warning(f"🎯 [{CFG.symbol}] 盈利达2.5R({pnl_pct*100:.2f}%)，再次分批止盈 {close_sz}张({int(_tp_2_5R_close_pct*100)}%)")
-                        try:
-                            close_side = "sell" if side == "long" else "buy"
-                            # 注：风控线程直接发起市价平仓，不经过 position_exec（紧急平仓逻辑）
-                            close_res  = self.okx._request(
-                                "POST", "/api/v5/trade/order",
-                                body_data={"instId": CFG.symbol, "tdMode": "isolated",
-                                           "side": close_side, "posSide": side,
-                                           "ordType": "market", "sz": str(close_sz),
-                                           "reduceOnly": "true"}
-                            )
-                            if close_res.get("code") == "0":
-                                sz_new = max(0, int(size - close_sz))
-                                # 锁内只做内存状态计算和状态持久化
-                                with lock:
-                                    partial_tp_2_5R_triggered = True
-                                    pos.partial_tp_2_5R_triggered = True
-                                    pos.size = sz_new
-                                    _sl_2r = pos.stop_loss or sl
-                                    _tp_2r = pos.take_profit or tp
-                                save_state_to_disk(pos)
-                                # 锁外才发起网络API调用，遵守"持锁期间禁止网络IO"规则
-                                _sz_for_algo = str(sz_new)
-                                _sl_for_algo_2 = _sl_2r
-                                _tp_for_algo_2 = _tp_2r
-                                self.trader._last_adjust_time = datetime.now(UTC)
-                                if sz_new > 0:
-                                    # 同步更新算法单（SL/TP）到剩余合约数，与 AI 分批止盈保持一致
-                                    self.okx.update_algo_orders(side, _sz_for_algo, _sl_for_algo_2, _tp_for_algo_2, symbol=CFG.symbol)
-                                    _webhook("🎯 2.5R分批止盈", f"[{CFG.symbol}] 再平{close_sz}张(30%)，剩余 sz={_sz_for_algo}")
-                                else:
-                                    # 最后一张合约已平，直接重置本地状态（无需等 WS pos=0）
-                                    log.info(f"✅ [{CFG.symbol}] 2.5R分批止盈后仓位归零，直接重置状态")
-                                    # P0 Fix: 全平后撤销交易所残留算法单
-                                    try:
-                                        self.okx.cancel_all_algo_orders(CFG.symbol)
-                                    except Exception:
-                                        pass
-                                    self.trader.state._reset_pos()
-                                    _webhook("🎯 2.5R分批止盈（全平）", f"[{CFG.symbol}] 再平{close_sz}张，仓位清零")
-                            else:
-                                log.error(f"❌ [{CFG.symbol}] 2.5R分批止盈失败: {close_res.get('msg', '')}")
-                        except Exception as e:
-                            log.error(f"[{CFG.symbol}] 2.5R分批止盈异常: {e}")
 
                 # ── 全局回撤因子写入 GS（position_exec 读取后联用胜率+市场模式）────
                 current_equity = self.trader.latest_equity
@@ -676,16 +579,31 @@ class RiskGuard:
     # ---------- 追踪止损 ----------
     def _check_trailing_stop(self, price: float, symbol: str = None, atr: float = 0, market_mode: str = "趋势", act_pct: float = None) -> bool:
         """
-        优化移动止损：使用ATR动态调整追踪距离
-        趋势市：追踪距离 1.5×ATR
-        震荡市：追踪距离 0.8×ATR
+        优化移动止损：ATR动态追踪距离 + 阶梯式盈利保护锁
+        方案A：收紧激活阈值(0.3%) + 追踪距离(1.0%)
+        方案B：浮盈≥1%/2%/3%三档保护锁，趋势市更松、震荡市更紧
         """
         sym = CFG.symbol
         pos = self.trader.pos
         if not pos.side or pos.entry_price == 0 or price <= 0:
             return False
+        # ==================== 防"边激活边触发"保护 ====================
+        # 激活后至少等待 30 秒才允许真正检查触发，防止同一轮或相邻风控循环中
+        # 价格刚满足激活条件就立刻回撤触发止损（常见于低波动震荡市）
+        if pos.trailing_active:
+            activated_ago = time.monotonic() - getattr(pos, 'trailing_activate_ts', 0.0)
+            if activated_ago < 30.0:
+                return False
+        # ============================================================
         is_update = False
         trigger   = False
+        is_trend  = market_mode == "趋势"
+
+        # ── 计算当前浮盈百分比 ───────────────────────────────────────────────
+        if pos.side == "long":
+            pnl_pct = (price - pos.entry_price) / pos.entry_price
+        else:
+            pnl_pct = (pos.entry_price - price) / pos.entry_price
 
         # ── ATR动态追踪距离 ─────────────────────────────────────────────────
         # 优先使用 AI 在 _do_light_adjust 中指定的倍数；否则按市场模式选择
@@ -693,13 +611,35 @@ class RiskGuard:
             if pos.trailing_dist_atr_mult is not None:
                 trailing_dist = pos.trailing_dist_atr_mult * atr / price  # AI 动态指定
             else:
-                # 震荡市放宽：1.2→1.5 ATR，震荡激进 1.5→1.8 ATR，趋势保持 2.0
-                _td_mult = 2.5 if market_mode == "趋势" else (2.5 if market_mode == "震荡激进" else 2.2)
+                # 趋势/震荡激进：2.5 ATR，其余：2.2 ATR（已收紧，早期版本更高）
+                _td_mult = 2.5 if is_trend else 2.2
                 trailing_dist = _td_mult * atr / price
                 # 最低价距兜底：ATR极小时至少 0.15%，防止正常噪声扫损
                 trailing_dist = max(trailing_dist, 0.0015)
         else:
             trailing_dist = CFG.trailing_dist_pct  # 兜底用配置值
+
+        # ── 阶梯 SL 对齐：trailing 不应比阶梯锁更宽松（留 5% 缓冲防抢跑）──
+        if pos.stop_loss and pos.peak_price > 0:
+            _sl_dist_from_peak = abs(pos.peak_price - pos.stop_loss) / pos.peak_price
+            if _sl_dist_from_peak < trailing_dist * 0.95:
+                trailing_dist = _sl_dist_from_peak
+
+        # ── VSpike 同向加持：≥8x 同向量能 → trailing 距离 ×1.5（让利润多跑）──
+        _vs_ss = self.trader.vspike.get_status() if hasattr(self.trader, 'vspike') else {}
+        _vs_ss_mult = _vs_ss.get("mult", 0.0)
+        _vs_ss_dir = _vs_ss.get("direction", "均衡")
+        _vs_ss_buy_pct = _vs_ss.get("buy_pct", 0.5)
+        _is_trend_capture = (
+            _vs_ss_mult >= _VSPIKE_SAME_SIDE_MULT and (
+                (pos.side == "long" and "买方主导" in _vs_ss_dir) or
+                (pos.side == "short" and "卖方主导" in _vs_ss_dir)
+            )
+        )
+        if _is_trend_capture and trailing_dist > 0:
+            trailing_dist *= 1.5
+            if self.trader._should_log("vs_same_side", 60.0):
+                log.info(f"⚡ [{sym}] VSpike同向加持: {_vs_ss_mult:.1f}x {_vs_ss_dir} → trailing×1.5")
 
         # ── 动态激活阈值：震荡市更早锁定利润 ────────────────────────────────
         eff_act_pct = act_pct if act_pct is not None else CFG.trailing_act_pct
@@ -708,10 +648,6 @@ class RiskGuard:
         holding_seconds = (datetime.now(UTC) - pos.open_time).total_seconds() if pos.open_time else 0
         holding_minutes = holding_seconds / 60
         if holding_seconds >= CFG.time_stop_profit_minutes * 60:  # 转换为秒
-            if pos.side == "long":
-                pnl_pct = (price - pos.entry_price) / pos.entry_price
-            else:
-                pnl_pct = (pos.entry_price - price) / pos.entry_price
             if 0 < pnl_pct < CFG.time_stop_profit_pct:
                 # 盈利不足，将止损移至成本价
                 if pos.side == "long":
@@ -728,8 +664,53 @@ class RiskGuard:
                     log.info(f"⏰ [{sym}] 时间止损触发：持仓{holding_minutes:.0f}分钟 盈利{pnl_pct*100:.2f}% 移动SL至{new_sl:.4f}")
         # ────────────────────────────────────────────────────────────────────────
 
+        # ── 方案B：盈利保护锁（阶梯式，区分趋势市/震荡市）─────────────────────
+        # 原则：SL只能单向移动（long只上移，short只下移），绝不回退
+        if pnl_pct >= 0.01:  # 浮盈≥1%才考虑
+            _lock_sl = None
+            _lock_reason = None
+            if is_trend:
+                # 趋势市：让利润跑更久
+                if pnl_pct >= 0.03:
+                    _lock_sl = pos.entry_price * (1 + 0.006) if pos.side == "long" else pos.entry_price * (1 - 0.006)
+                    _lock_reason = "趋势市3%锁利(+0.6%)"
+                elif pnl_pct >= 0.02:
+                    _lock_sl = pos.entry_price * (1 + 0.002) if pos.side == "long" else pos.entry_price * (1 - 0.002)
+                    _lock_reason = "趋势市2%锁利(+0.2%)"
+                # 1%档趋势市不移动SL，让利润跑
+            else:
+                # 震荡市：优先锁利
+                if pnl_pct >= 0.03:
+                    _lock_sl = pos.entry_price * (1 + 0.009) if pos.side == "long" else pos.entry_price * (1 - 0.009)
+                    _lock_reason = "震荡市3%锁利(+0.9%)"
+                elif pnl_pct >= 0.02:
+                    _lock_sl = pos.entry_price * (1 + 0.004) if pos.side == "long" else pos.entry_price * (1 - 0.004)
+                    _lock_reason = "震荡市2%锁利(+0.4%)"
+                elif pnl_pct >= 0.01:
+                    _lock_sl = pos.entry_price * (1 - 0.001) if pos.side == "long" else pos.entry_price * (1 + 0.001)
+                    _lock_reason = "震荡市1%保本(-0.1%)"
+
+            if _lock_sl is not None and pos.stop_loss is not None:
+                # 单向移动保护：long只允许上移，short只允许下移
+                if pos.side == "long" and _lock_sl > pos.stop_loss:
+                    self.trader._pos_mgr.submit(PositionIntent(
+                        intent_type=PositionIntentType.UPDATE_SL,
+                        payload={"sl": _lock_sl},
+                        reason=f"profit_lock_{_lock_reason}"
+                    ))
+                    is_update = True
+                    log.info(f"💰 [{sym}] 盈利保护锁 {_lock_reason} | 浮盈{pnl_pct*100:.2f}% | SL {pos.stop_loss:.4f} → {_lock_sl:.4f}")
+                elif pos.side == "short" and _lock_sl < pos.stop_loss:
+                    self.trader._pos_mgr.submit(PositionIntent(
+                        intent_type=PositionIntentType.UPDATE_SL,
+                        payload={"sl": _lock_sl},
+                        reason=f"profit_lock_{_lock_reason}"
+                    ))
+                    is_update = True
+                    log.info(f"💰 [{sym}] 盈利保护锁 {_lock_reason} | 浮盈{pnl_pct*100:.2f}% | SL {pos.stop_loss:.4f} → {_lock_sl:.4f}")
+        # ────────────────────────────────────────────────────────────────────────
+
         if pos.side == "long":
-            pnl_pct = (price - pos.entry_price) / pos.entry_price
             if price > pos.peak_price:
                 self.trader._pos_mgr.submit(PositionIntent(
                     intent_type=PositionIntentType.UPDATE_PEAK,
@@ -740,7 +721,10 @@ class RiskGuard:
             if pnl_pct >= eff_act_pct and not pos.trailing_active:
                 self.trader._pos_mgr.submit(PositionIntent(
                     intent_type=PositionIntentType.UPDATE_PEAK,
-                    payload={"trailing_active": True},
+                    payload={
+                        "trailing_active": True,
+                        "trailing_activate_ts": time.monotonic()   # 记录激活时间，防"边激活边触发"
+                    },
                     reason="trailing_long_activate"
                 ))
                 is_update = True
@@ -748,10 +732,14 @@ class RiskGuard:
             if pos.trailing_active:
                 drawdown = (pos.peak_price - price) / pos.peak_price
                 if drawdown >= trailing_dist:
-                    log.info(f"📉 [{sym}] 追踪止损触发(多) 峰值={pos.peak_price:.4f} 回撤={drawdown*100:.2f}%")
+                    _trailing_sl = pos.peak_price * (1 - trailing_dist)
+                    _sl_compared = f"SL={pos.stop_loss:.4f}" if pos.stop_loss else "无SL"
+                    if pos.stop_loss and pos.stop_loss > _trailing_sl:
+                        log.info(f"📉 [{sym}] 追踪止损触发(多) 峰值={pos.peak_price:.4f} 回撤={drawdown*100:.2f}% | {_sl_compared} 更激进 → 阶梯已保护")
+                    else:
+                        log.info(f"📉 [{sym}] 追踪止损触发(多) 峰值={pos.peak_price:.4f} 回撤={drawdown*100:.2f}%")
                     trigger = True
         else:
-            pnl_pct = (pos.entry_price - price) / pos.entry_price
             if price < pos.peak_price or pos.peak_price == 0:
                 self.trader._pos_mgr.submit(PositionIntent(
                     intent_type=PositionIntentType.UPDATE_PEAK,
@@ -762,7 +750,10 @@ class RiskGuard:
             if pnl_pct >= eff_act_pct and not pos.trailing_active:
                 self.trader._pos_mgr.submit(PositionIntent(
                     intent_type=PositionIntentType.UPDATE_PEAK,
-                    payload={"trailing_active": True},
+                    payload={
+                        "trailing_active": True,
+                        "trailing_activate_ts": time.monotonic()   # 记录激活时间，防"边激活边触发"
+                    },
                     reason="trailing_short_activate"
                 ))
                 is_update = True
@@ -770,11 +761,155 @@ class RiskGuard:
             if pos.trailing_active:
                 rally = (price - pos.peak_price) / pos.peak_price
                 if rally >= trailing_dist:
-                    log.info(f"📈 [{sym}] 追踪止损触发(空) 低点={pos.peak_price:.4f} 反弹={rally*100:.2f}%")
+                    _trailing_sl = pos.peak_price * (1 + trailing_dist)
+                    _sl_compared = f"SL={pos.stop_loss:.4f}" if pos.stop_loss else "无SL"
+                    if pos.stop_loss and pos.stop_loss < _trailing_sl:
+                        log.info(f"📈 [{sym}] 追踪止损触发(空) 低点={pos.peak_price:.4f} 反弹={rally*100:.2f}% | {_sl_compared} 更激进 → 阶梯已保护")
+                    else:
+                        log.info(f"📈 [{sym}] 追踪止损触发(空) 低点={pos.peak_price:.4f} 反弹={rally*100:.2f}%")
                     trigger = True
         if is_update:
             save_state_to_disk(pos)
         return trigger
+
+    # ---------- 阶梯盈利锁 ----------
+    def _profit_ladder_lock(
+        self, price, sl, entry, side, size, pnl_pct, sl_dist_pct,
+        ladder_levels, lock_r_values, multi_close_pcts,
+        osc_add_r, market_mode
+    ):
+        """
+        统一阶梯盈利锁 V2 —— 2026 最终版（取代 moved_stop / 1.5R / 2.5R）。
+        核心原则：
+          - 用 R（初始SL距离）做统一标尺，SL 只单向移动
+          - L1（0.8R）强制保本：SL 移到 entry ± 0.1%，只移 SL 不分批
+          - L2~L4：正常阶梯锁 + 分批平仓
+          - VSpike 同向加持（≥8x）：lock_r ×0.7 让利润多跑，跳过震荡市额外收紧
+          - 震荡市每档额外 +osc_add_r 激进锁利（同向 VSpike 时跳过）
+        """
+        pos = self.trader.pos
+        lock = self.trader.lock
+        current_level = getattr(pos, 'ladder_level', 0)
+        if current_level >= len(ladder_levels):
+            return  # 已到达最高阶梯，后续由追踪止损接管
+
+        target_r = ladder_levels[current_level]
+        if pnl_pct < sl_dist_pct * target_r:
+            return  # 尚未达到当前阶梯触发点
+
+        # ── VSpike 同向加持检测 ─────────────────────────────────────
+        _vs_ss = self.trader.vspike.get_status() if hasattr(self.trader, 'vspike') else {}
+        _vs_ss_mult = _vs_ss.get("mult", 0.0)
+        _vs_ss_dir = _vs_ss.get("direction", "均衡")
+        _is_trend_capture = (
+            _vs_ss_mult >= _VSPIKE_SAME_SIDE_MULT and (
+                (side == "long" and "买方主导" in _vs_ss_dir) or
+                (side == "short" and "卖方主导" in _vs_ss_dir)
+            )
+        )
+
+        # 计算锁利润距离
+        lock_r = lock_r_values[current_level]
+        is_osc = market_mode in ("震荡", "震荡激进")
+
+        if _is_trend_capture:
+            # VSpike 同向加持：锁利 ×0.7，让利润多跑
+            lock_r = lock_r * 0.7
+            # 跳过震荡市额外收紧（优先级：同向 VSpike > 震荡市收紧）
+        elif is_osc and current_level > 0:
+            lock_r = lock_r + osc_add_r
+
+        new_sl = entry
+        if side == "long":
+            new_sl = entry + lock_r * sl_dist_pct * entry if lock_r > 0 else entry
+        else:
+            new_sl = entry - lock_r * sl_dist_pct * entry if lock_r > 0 else entry
+
+        # 单向移动保护：long 只允许上移 SL，short 只允许下移 SL
+        should_move = (
+            (side == "long" and new_sl > pos.stop_loss) or
+            (side == "short" and new_sl < pos.stop_loss)
+        )
+        if not should_move:
+            # SL 已在更优位置，直接升级阶梯
+            with lock:
+                pos.ladder_level = current_level + 1
+                if current_level == 0:
+                    pos.breakeven_triggered = True
+                    pos.partial_tp_triggered = True
+            save_state_to_disk(pos)
+            return
+
+        if int(size) <= 1:
+            # ── 1张仓位：只移SL，不分批（L1 保本强制）───────────────
+            with lock:
+                pos.stop_loss = new_sl
+                pos.moved_stop = True
+                pos.ladder_level = current_level + 1
+                if current_level == 0:
+                    pos.breakeven_triggered = True
+                    pos.partial_tp_triggered = True
+            save_state_to_disk(pos)
+            algo_ok = self.okx.update_algo_orders(side, "1", new_sl, pos.take_profit, symbol=CFG.symbol)
+            if algo_ok:
+                label = "保本" if current_level == 0 else f"+{lock_r:.1f}R"
+                tc_tag = " [VSpike加持]" if _is_trend_capture else ""
+                log.info(f"🪜 [{CFG.symbol}] L{current_level+1} 阶梯锁(1张){tc_tag} → SL={new_sl:.4f}({label})")
+            self.trader._last_adjust_time = datetime.now(UTC)
+        else:
+            # ── 多张仓位：分批平仓 + 移SL ─────────────────────────
+            close_pct = multi_close_pcts[current_level]
+            close_sz = max(1, int(size * close_pct))
+            if close_sz >= int(size):
+                # 仓位太小无法分批，只移SL
+                close_sz = 0
+
+            if close_sz > 0:
+                close_side = "sell" if side == "long" else "buy"
+                close_res = self.okx._request(
+                    "POST", "/api/v5/trade/order",
+                    body_data={"instId": CFG.symbol, "tdMode": "isolated",
+                               "side": close_side, "posSide": side,
+                               "ordType": "market", "sz": str(close_sz),
+                               "reduceOnly": "true"}
+                )
+                if close_res.get("code") != "0":
+                    log.error(f"❌ [{CFG.symbol}] L{current_level+1} 阶梯分批平仓失败: {close_res.get('msg', '')}")
+                    return  # 不升级阶梯，下轮重试
+
+                sz_remain = max(1, int(size - close_sz))
+                with lock:
+                    pos.size = sz_remain
+                    pos.stop_loss = new_sl
+                    pos.moved_stop = True
+                    pos.ladder_level = current_level + 1
+                    if current_level == 0:
+                        pos.breakeven_triggered = True
+                        pos.partial_tp_triggered = True
+                save_state_to_disk(pos)
+                # 锁外更新算法单
+                algo_ok = self.okx.update_algo_orders(side, str(sz_remain), new_sl, pos.take_profit, symbol=CFG.symbol)
+                if algo_ok:
+                    label = "保本" if current_level == 0 else f"+{lock_r:.1f}R"
+                    tc_tag = " [VSpike加持]" if _is_trend_capture else ""
+                    log.info(f"🪜 [{CFG.symbol}] L{current_level+1} 阶梯平{close_sz}张({close_pct*100:.0f}%){tc_tag} → SL={new_sl:.4f}({label})")
+                self.trader._last_adjust_time = datetime.now(UTC)
+            else:
+                # 无法分批，只移SL
+                with lock:
+                    pos.stop_loss = new_sl
+                    pos.moved_stop = True
+                    pos.ladder_level = current_level + 1
+                    if current_level == 0:
+                        pos.breakeven_triggered = True
+                        pos.partial_tp_triggered = True
+                save_state_to_disk(pos)
+                algo_ok = self.okx.update_algo_orders(side, str(int(size)), new_sl, pos.take_profit, symbol=CFG.symbol)
+                if algo_ok:
+                    label = "保本" if current_level == 0 else f"+{lock_r:.1f}R"
+                    tc_tag = " [VSpike加持]" if _is_trend_capture else ""
+                    log.info(f"🪜 [{CFG.symbol}] L{current_level+1} 阶梯锁(不分批){tc_tag} → SL={new_sl:.4f}({label})")
+                self.trader._last_adjust_time = datetime.now(UTC)
 
     # ---------- 资金费率风险检查 ----------
     def _check_funding_risk(self, funding: Dict, action: str, confidence: float = 0.0) -> bool:
