@@ -2,6 +2,7 @@
 market_data.py — 数据爬虫与指标计算
 """
 import requests, logging, time, json, math, re
+from collections import deque
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -27,6 +28,7 @@ _NEGATIVE_KW_EN = ["crash", "plunge", "outflow", "hack", "banned", "bearish",
                    "rate hike", "hawkish", "sanction", "war", "conflict", "tariff",
                    "default", "recession", "contagion", "sec sue"]
 _NEGATION_PREFIX = ["不", "未", "无", "非", "没有", "不会", "不曾"]
+_NEGATION_PREFIX_EN = ["not ", "n't ", "never ", "no "]
 
 def _has_negation(text: str, kw: str) -> bool:
     """判断关键词前 5 字内是否有否定词，有则不计入情绪"""
@@ -36,14 +38,22 @@ def _has_negation(text: str, kw: str) -> bool:
     prefix = text[max(0, idx-5):idx]
     return any(neg in prefix for neg in _NEGATION_PREFIX)
 
+def _has_negation_en(text: str, kw: str) -> bool:
+    """判断英文关键词前 10 字符内是否有否定词（如 not/n't/never/no）"""
+    idx = text.lower().find(kw.lower())
+    if idx < 0 or idx < 10:
+        return False
+    prefix = text[max(0, idx-10):idx].lower()
+    return any(neg in prefix for neg in _NEGATION_PREFIX_EN)
+
 def _score_title(t: str, source_weight: float = 1.0) -> float:
     """计算标题得分（中英文关键词），乘以来源权重"""
     pos = sum(1 for k in _POSITIVE_KW if k in t and not _has_negation(t, k))
     neg = sum(1 for k in _NEGATIVE_KW if k in t and not _has_negation(t, k))
-    # 英文关键词：大小写不敏感匹配
+    # 英文关键词：大小写不敏感匹配，含否定词检测
     t_lower = t.lower()
-    pos += sum(1 for k in _POSITIVE_KW_EN if k in t_lower)
-    neg += sum(1 for k in _NEGATIVE_KW_EN if k in t_lower)
+    pos += sum(1 for k in _POSITIVE_KW_EN if k in t_lower and not _has_negation_en(t, k))
+    neg += sum(1 for k in _NEGATIVE_KW_EN if k in t_lower and not _has_negation_en(t, k))
     return (pos - neg) * source_weight
 
 
@@ -196,7 +206,11 @@ def fetch_market_sentiment_data(symbol: str = "ETH-USDT-SWAP") -> Dict:
         "ls_ratio":       None,
         "oi":             None,
         "oi_change_pct":  None,
+        "oi_change_15m":  None,
+        "oi_change_1h":   None,
         "taker_buy_ratio": None,
+        "taker_buy_5m":   None,
+        "taker_buy_15m":  None,
         "_valid":         False,
     }
     base = "https://www.okx.com"
@@ -211,33 +225,71 @@ def fetch_market_sentiment_data(symbol: str = "ETH-USDT-SWAP") -> Dict:
             if len(ls_data) >= 1:
                 result["ls_ratio"] = round(float(ls_data[0].get("longShortAccRatio", 1.0)), 3)
 
-        oi_resp = requests.get(
+        # OI 双窗口：5min粒度(15min变化) + 1H粒度(1h变化)
+        oi_5m_resp = requests.get(
+            f"{base}/api/v5/rubik/stat/contracts/open-interest-volume",
+            params={"instId": symbol, "period": "5m", "limit": "4"},
+            timeout=(3, 5),
+        )
+        if oi_5m_resp.status_code == 200:
+            oi_5m_data = oi_5m_resp.json().get("data", [])
+            if len(oi_5m_data) >= 2:
+                oi_cur = float(oi_5m_data[0].get("oi", 0))
+                oi_15m_ago = float(oi_5m_data[-1].get("oi", 0))
+                result["oi"] = round(oi_cur, 0)
+                if oi_15m_ago > 0:
+                    result["oi_change_15m"] = round((oi_cur - oi_15m_ago) / oi_15m_ago * 100, 2)
+
+        oi_1h_resp = requests.get(
             f"{base}/api/v5/rubik/stat/contracts/open-interest-volume",
             params={"instId": symbol, "period": "1H", "limit": "3"},
             timeout=(3, 5),
         )
-        if oi_resp.status_code == 200:
-            oi_data = oi_resp.json().get("data", [])
-            if len(oi_data) >= 2:
-                oi_cur  = float(oi_data[0].get("oi",  0))
-                oi_prev = float(oi_data[-1].get("oi", 0))
-                result["oi"] = round(oi_cur, 0)
-                if oi_prev > 0:
-                    result["oi_change_pct"] = round((oi_cur - oi_prev) / oi_prev * 100, 2)
+        if oi_1h_resp.status_code == 200:
+            oi_1h_data = oi_1h_resp.json().get("data", [])
+            if len(oi_1h_data) >= 2:
+                oi_cur_1h = float(oi_1h_data[0].get("oi", 0))
+                oi_1h_ago = float(oi_1h_data[-1].get("oi", 0))
+                if oi_1h_ago > 0:
+                    result["oi_change_1h"] = round((oi_cur_1h - oi_1h_ago) / oi_1h_ago * 100, 2)
+                # 兼容旧字段
+                if result["oi"] is None:
+                    result["oi"] = round(oi_cur_1h, 0)
+                if result.get("oi_change_pct") is None:
+                    result["oi_change_pct"] = result["oi_change_1h"]
 
-        taker_resp = requests.get(
+        # Taker Buy Ratio 多窗口：5min(短期进攻) + 1H(中期趋势)
+        taker_5m_resp = requests.get(
             f"{base}/api/v5/rubik/stat/taker-volume",
-            params={"instId": symbol, "instType": "CONTRACTS", "period": "1H", "limit": "1"},
+            params={"instId": symbol, "instType": "CONTRACTS", "period": "5m", "limit": "1"},
             timeout=(3, 5),
         )
-        if taker_resp.status_code == 200:
-            t_data = taker_resp.json().get("data", [])
-            if t_data:
-                buy_vol  = float(t_data[0].get("buyVol",  0))
-                sell_vol = float(t_data[0].get("sellVol", 0))
-                total    = buy_vol + sell_vol
-                if total > 0:
-                    result["taker_buy_ratio"] = round(buy_vol / total, 3)
+        if taker_5m_resp.status_code == 200:
+            t_5m_data = taker_5m_resp.json().get("data", [])
+            if t_5m_data:
+                buy_5m = float(t_5m_data[0].get("buyVol", 0))
+                sell_5m = float(t_5m_data[0].get("sellVol", 0))
+                total_5m = buy_5m + sell_5m
+                if total_5m > 0:
+                    result["taker_buy_5m"] = round(buy_5m / total_5m, 3)
+
+        taker_15m_resp = requests.get(
+            f"{base}/api/v5/rubik/stat/taker-volume",
+            params={"instId": symbol, "instType": "CONTRACTS", "period": "15m", "limit": "1"},
+            timeout=(3, 5),
+        )
+        if taker_15m_resp.status_code == 200:
+            t_15m_data = taker_15m_resp.json().get("data", [])
+            if t_15m_data:
+                buy_15m = float(t_15m_data[0].get("buyVol", 0))
+                sell_15m = float(t_15m_data[0].get("sellVol", 0))
+                total_15m = buy_15m + sell_15m
+                if total_15m > 0:
+                    result["taker_buy_15m"] = round(buy_15m / total_15m, 3)
+
+        # 兼容旧字段：用15min数据填充taker_buy_ratio
+        if result["taker_buy_ratio"] is None:
+            result["taker_buy_ratio"] = result["taker_buy_15m"]
 
         result["_valid"] = any(v is not None for v in [
             result["ls_ratio"], result["oi"], result["taker_buy_ratio"]
@@ -251,15 +303,19 @@ def fetch_market_sentiment_data(symbol: str = "ETH-USDT-SWAP") -> Dict:
 # ============================================================
 # 宏观记忆：自动计算 ATH/ATL 距离 + 波动率环境
 # ============================================================
-def build_macro_context(daily_data: Optional[list], current_price: float) -> str:
+def build_macro_context(daily_data: Optional[list], current_price: float) -> Tuple[str, str]:
     """
     宏观记忆层：纯客观数据驱动，从日线K线自动计算。
     不注入任何人工主观判断，消除认知偏见。
     输出原则：语义描述而非绝对价格，让 AI 直接获得市场结构结论。
+
+    返回 (full_text, short_text)：
+      - full_text：完整描述，供日志/回测/调试使用
+      - short_text：约150~200字符精简版，供 AI prompt token 节省使用
     """
     parts = []
     if not (daily_data and len(daily_data) >= 20 and current_price > 0):
-        return "\n".join(parts) if parts else ""
+        return "", ""
     try:
         df = pd.DataFrame(daily_data,
                           columns=["ts","o","h","l","c","v","volCcy","volCcyQuote","confirm"])
@@ -310,7 +366,21 @@ def build_macro_context(daily_data: Optional[list], current_price: float) -> str
     except Exception as e:
         log.debug(f"宏观上下文计算失败: {e}")
 
-    return "\n".join(parts) if parts else ""
+    full_text = "\n".join(parts) if parts else ""
+
+    # short_text：约150~200字符，提取核心信息供 AI prompt 使用
+    short_parts = []
+    if parts:
+        short_parts.append(parts[0])  # "价格位置: ..."
+        if len(parts) > 1:
+            # 波动率部分截断：去掉"建议..."等长尾描述
+            vol_line = parts[1]
+            if "建议" in vol_line:
+                vol_line = vol_line.split("建议")[0].rstrip("，")
+            short_parts.append(vol_line)
+    short_text = " | ".join(short_parts)
+
+    return full_text, short_text
 
 
 # ============================================================
@@ -340,68 +410,6 @@ def _get_ma_alignment(ind_4h: Dict) -> int:
         return 0
 
 
-def build_market_context(key_levels: Dict, sentiment: Dict, current_price: float) -> str:
-    """
-    将 L3（关键价位）和 L4（市场情绪深度）合并为紧凑文本，供 AI Prompt 使用。
-    """
-    lines = []
-
-    if key_levels.get("_valid"):
-        resistances = key_levels.get("resistances", [])
-        supports    = key_levels.get("supports", [])
-        atr_d       = key_levels.get("atr_daily", 0)
-
-        lines.append("[L3 历史关键价位（日线Pivot，近3月）]")
-        if resistances:
-            r_parts = []
-            for r in resistances[:3]:
-                if current_price > 0:
-                    dist_pct = (r["price"] - current_price) / current_price * 100
-                    r_parts.append(f"{r['price']:.2f}(测试{r['count']}次,距今+{dist_pct:.1f}%)")
-                else:
-                    r_parts.append(f"{r['price']:.2f}(测试{r['count']}次)")
-            lines.append(f"  阻力: {' | '.join(r_parts)}")
-        else:
-            lines.append("  阻力: 上方无明显历史阻力")
-
-        if supports:
-            s_parts = []
-            for s in supports[:3]:
-                if current_price > 0:
-                    dist_pct = (current_price - s["price"]) / current_price * 100
-                    s_parts.append(f"{s['price']:.2f}(测试{s['count']}次,距今-{dist_pct:.1f}%)")
-                else:
-                    s_parts.append(f"{s['price']:.2f}(测试{s['count']}次)")
-            lines.append(f"  支撑: {' | '.join(s_parts)}")
-        else:
-            lines.append("  支撑: 下方无明显历史支撑")
-
-        if atr_d > 0:
-            lines.append(f"  日线ATR参考: {atr_d:.2f} USDT")
-
-    if sentiment.get("_valid"):
-        lines.append("\n[L4 市场情绪深度（OKX统计，1H周期）]")
-
-        ls = sentiment.get("ls_ratio")
-        if ls is not None:
-            ls_desc = "多头拥挤⚠️" if ls > 1.5 else ("空头拥挤⚠️" if ls < 0.7 else "多空均衡")
-            lines.append(f"  多空账户比: {ls:.3f} → {ls_desc}")
-
-        oi    = sentiment.get("oi")
-        oi_ch = sentiment.get("oi_change_pct")
-        if oi is not None:
-            oi_str = f"  持仓量(OI): {oi:,.0f} ETH"
-            if oi_ch is not None:
-                oi_signal = "🔴大规模清算/减仓" if oi_ch < -3 else ("🟡小幅减仓" if oi_ch < -1 else ("🟢持仓增加" if oi_ch > 2 else "稳定"))
-                oi_str += f"  1H变化: {oi_ch:+.2f}% → {oi_signal}"
-            lines.append(oi_str)
-
-        tbr = sentiment.get("taker_buy_ratio")
-        if tbr is not None:
-            tbr_desc = "买盘主导🟢" if tbr > 0.55 else ("卖盘主导🔴" if tbr < 0.45 else "买卖均衡")
-            lines.append(f"  主动买入比: {tbr:.3f} → {tbr_desc}")
-
-    return "\n".join(lines) if lines else "（L3/L4数据不可用）"
 
 
 # ── 技术指标计算 ─────────────────────────────────────────────────────────
@@ -486,11 +494,11 @@ def calc_indicators(data: list) -> Dict:
         _atr_avg = float(_atr_series.tail(min(200, len(_atr_series))).mean())
         _atr_ratio = _atr_raw / (_atr_avg + 1e-9) if _atr_avg > 0 else 1.0
         if _atr_ratio > 1.5:
-            _atr_mult = 3.0  # 高波动放宽截断
+            _atr_mult = CFG.atr_trunc_mult_high
         elif _atr_ratio < 0.8:
-            _atr_mult = 1.5  # 低波动收紧截断
+            _atr_mult = CFG.atr_trunc_mult_low
         else:
-            _atr_mult = 2.0  # 正常
+            _atr_mult = CFG.atr_trunc_mult_normal
         _cap_up  = _sentinel_close + _atr_mult * _atr_raw
         _cap_dn  = _sentinel_close - _atr_mult * _atr_raw
         _recent  = min(5, len(df))
@@ -550,13 +558,15 @@ def calc_indicators(data: list) -> Dict:
 
         recent = df.tail(20)
 
-        if "volCcyQuote" in df.columns and not df["volCcyQuote"].isnull().all():
+        if "volCcyQuote" in df.columns and df["volCcyQuote"].notna().any():
             quote_vol = df["volCcyQuote"].astype(float)
-            vwap = (quote_vol.sum()) / (vol.sum() + 1e-9)
+            valid_mask = quote_vol.notna()
+            total_quote_vol = quote_vol[valid_mask].sum()
+            total_vol = vol[valid_mask].sum()
+            vwap = total_quote_vol / (total_vol + 1e-9) if total_vol > 0 else close.iloc[-1]
         else:
-            quote_vol = close * vol
-            vwap = quote_vol.sum() / (vol.sum() + 1e-9)
-        vwap_dist_pct = (close.iloc[-1] - vwap) / vwap * 100
+            vwap = close.iloc[-1]  # 占位，实际 vwap_dist_pct 会被置 0
+        vwap_dist_pct = (close.iloc[-1] - vwap) / vwap * 100 if vwap > 0 else 0.0
         vwap_dist_pct = max(-20.0, min(20.0, vwap_dist_pct))
 
         delta = close.diff()
@@ -593,7 +603,6 @@ def calc_indicators(data: list) -> Dict:
         _price_ema_dist = (close.iloc[-1] - ema9_val) / (ema9_val + 1e-9)
         _ema_slope = (ema9_val - float(close.ewm(span=9, adjust=False).mean().iloc[-3])) / (ema9_val + 1e-9)
         _ma_stability = (1.0 if _price_ema_dist > 0 else 0.0) * (1.0 if _ema_slope > 0 else 0.5)
-        # ADX 门控：趋势强度不足时，EMA/稳定性得分被压缩，避免假趋势给高分
         adx_gate = min(1.0, adx_val / 30.0)
         regime_score = round(
             _adx_score * 0.40 +
@@ -601,6 +610,8 @@ def calc_indicators(data: list) -> Dict:
             (_macd_score * 0.5 + 0.5) * 0.10,
             3
         )
+        # 注：regime_score 在此计算仅作为技术指标参考值，
+        # 实际市场模式分类由 get_market_mode() → calc_composite_regime_score() 负责（含 Hurst + BB宽度）
 
         return {
             "_valid":          True,
@@ -636,10 +647,11 @@ def calc_indicators(data: list) -> Dict:
         return {"_valid": False}
 
 
-def build_kline_series(ind_15m: Dict, ind_1h: Dict, n_15m: int = 15, n_1h: int = 5) -> str:
+def build_kline_series(ind_15m: Dict, ind_1h: Dict, ind_4h: Dict = None, n_15m: int = 15, n_1h: int = 6) -> str:
     """
     从 calc_indicators 返回的 _df 中提取最近 N 根已计算特征的 K 线，
     构造供 AI 感知趋势动态的紧凑文本。
+    新增：4H K 线序列（n_4h=4 根，判断大级别趋势方向）。
     """
     lines = []
 
@@ -703,7 +715,91 @@ def build_kline_series(ind_15m: Dict, ind_1h: Dict, n_15m: int = 15, n_1h: int =
             arrow = "↑" if pct > 0.3 else ("↓" if pct < -0.3 else "→")
             lines.append(f"  {arrow} Δ{pct:+.2f}% RSI={rsi:.0f} MACD={'▲' if mh > 0 else '▼'}")
 
+    # 4H 大级别趋势（4 根 K 线，判断方向是否与 15m/1H 共振）
+    if ind_4h is not None:
+        df_4h: Optional[pd.DataFrame] = ind_4h.get("_df")
+        if df_4h is not None and len(df_4h) >= 4:
+            lines.append(f"\n[4H最近4根大级别趋势]")
+            for _, row in df_4h.tail(4).iterrows():
+                pct = row.get("pct_chg", 0.0)
+                rsi = row.get("rsi", 50.0)
+                mh  = row.get("macd_hist", 0.0)
+                bbp = row.get("bb_pct", 0.5)
+                arrow = "↑" if pct > 0.5 else ("↓" if pct < -0.5 else "→")
+                lines.append(f"  {arrow} Δ{pct:+.2f}% RSI={rsi:.0f} MACD={'▲' if mh > 0 else '▼'} BB={bbp:.2f}")
+
     return "\n".join(lines) if lines else "（K线序列数据不可用）"
+
+
+def build_multi_tf_alignment(ind_15m: Dict, ind_1h: Dict, ind_4h: Dict) -> str:
+    """
+    构建多周期指标对齐摘要，帮助 AI 判断周期共振。
+    输出格式：[多周期对齐] RSI:15m=66↑ 1H=62↑ 4H=58→ | MACD:15m=▲ 1H=▲ 4H=▼ | 共振:偏多(2/3同向)
+    """
+    def _trend_arrow(cur: float, prev: float) -> str:
+        diff = cur - prev
+        if diff > 1.0:
+            return "↑"
+        elif diff < -1.0:
+            return "↓"
+        return "→"
+
+    rsi_15m = ind_15m.get("rsi", 50.0)
+    rsi_1h = ind_1h.get("rsi", 50.0)
+    rsi_4h = ind_4h.get("rsi", 50.0)
+
+    macd_15m = ind_15m.get("macd_hist", 0.0)
+    macd_1h = ind_1h.get("macd_hist", 0.0)
+    macd_4h = ind_4h.get("macd_hist", 0.0)
+
+    # 获取上一周期值（通过 _df 取倒数第二根）
+    def _prev_rsi(df: Optional[pd.DataFrame]) -> float:
+        if df is not None and len(df) >= 2:
+            return float(df["rsi"].iloc[-2])
+        return 50.0
+
+    df_15m = ind_15m.get("_df")
+    df_1h = ind_1h.get("_df")
+    df_4h = ind_4h.get("_df")
+
+    rsi_15m_prev = _prev_rsi(df_15m)
+    rsi_1h_prev = _prev_rsi(df_1h)
+    rsi_4h_prev = _prev_rsi(df_4h)
+
+    rsi_15m_arr = f"{rsi_15m:.0f}{_trend_arrow(rsi_15m, rsi_15m_prev)}"
+    rsi_1h_arr = f"{rsi_1h:.0f}{_trend_arrow(rsi_1h, rsi_1h_prev)}"
+    rsi_4h_arr = f"{rsi_4h:.0f}{_trend_arrow(rsi_4h, rsi_4h_prev)}"
+
+    macd_15m_sym = "▲" if macd_15m > 0 else "▼"
+    macd_1h_sym = "▲" if macd_1h > 0 else "▼"
+    macd_4h_sym = "▲" if macd_4h > 0 else "▼"
+
+    # 计算共振方向：RSI>50 算多，MACD>0 算多，统计各周期偏向
+    _tf_bull = 0
+    _tf_bear = 0
+    for _rsi in (rsi_15m, rsi_1h, rsi_4h):
+        if _rsi > 55:
+            _tf_bull += 1
+        elif _rsi < 45:
+            _tf_bear += 1
+    for _macd in (macd_15m, macd_1h, macd_4h):
+        if _macd > 0:
+            _tf_bull += 1
+        else:
+            _tf_bear += 1
+
+    if _tf_bull >= 4:
+        _resonance = f"共振:偏多({_tf_bull}/6)"
+    elif _tf_bear >= 4:
+        _resonance = f"共振:偏空({_tf_bear}/6)"
+    elif _tf_bull > _tf_bear:
+        _resonance = f"分歧:略偏多({_tf_bull}:{_tf_bear})"
+    elif _tf_bear > _tf_bull:
+        _resonance = f"分歧:略偏空({_tf_bear}:{_tf_bull})"
+    else:
+        _resonance = "中性无方向"
+
+    return f"[多周期对齐] RSI: 15m={rsi_15m_arr} 1H={rsi_1h_arr} 4H={rsi_4h_arr} | MACD: 15m={macd_15m_sym} 1H={macd_1h_sym} 4H={macd_4h_sym} | {_resonance}"
 
 
 def calc_key_levels(ind_1h: Dict, ind_4h: Dict, current_price: float) -> Dict:
@@ -809,6 +905,118 @@ def rsi_signal_to_reason(signal: str, rsi: float) -> str:
         "short": f"超买 RSI={rsi:.1f}，回落信号",
     }.get(signal, "")
 
+
+# ====================== 复合 Regime Score ======================
+def _normalize(x: float, lo: float, hi: float) -> float:
+    """线性归一化到 [0,1]"""
+    return max(0.0, min(1.0, (x - lo) / (hi - lo + 1e-9)))
+
+
+def calculate_hurst(returns: np.ndarray, window: int = 30) -> float:
+    """计算 Hurst 指数，带严格数据量防护"""
+    if len(returns) < max(window, 10):
+        return 0.5  # 数据不足时中性
+
+    series = returns[-window:]
+
+    lags = list(range(2, max(10, len(series) // 3)))
+    rs_vals = []
+
+    for lag in lags:
+        chunks = np.array_split(series, max(1, len(series) // lag))
+        rs = []
+        for chunk in chunks:
+            if len(chunk) < 2:
+                continue
+            mean = np.mean(chunk)
+            y = np.cumsum(chunk - mean)
+            r = np.max(y) - np.min(y)
+            s = np.std(chunk)
+            if s <= 0 or r <= 0:
+                continue
+            rs.append(r / s)
+
+        if rs:
+            rs_vals.append(np.mean(rs))
+
+    # === 关键防护：至少需要 3 个有效 rs 值才能拟合 ===
+    if len(rs_vals) < 3:
+        return 0.5  # 数据不足或过于平稳，返回中性值
+
+    # 正常拟合
+    rs_vals = np.array(rs_vals)
+    lags_arr = np.array(lags[:len(rs_vals)])
+    try:
+        poly = np.polyfit(np.log(lags_arr), np.log(rs_vals), 1)
+        hurst = float(poly[0])
+        # 可选：合理性截断
+        return max(0.0, min(1.0, hurst))
+    except Exception:
+        return 0.5
+
+
+def calc_composite_regime_score(ind_15m: Dict, funding: Dict = None,
+                                returns_30: np.ndarray = None) -> float:
+    """
+    复合 Regime Score（0~1）：越高 = 越震荡/均值回归
+    """
+    price = ind_15m.get("price", 1)
+    bb_upper = ind_15m.get("bb_upper", price)
+    bb_lower = ind_15m.get("bb_lower", price)
+    bb_width = (bb_upper - bb_lower) / max(price, 1)
+    bb_score = _normalize(bb_width, 0.015, 0.06)
+
+    adx = ind_15m.get("adx", 25)
+    adx_score = _normalize(45 - adx, 0, 25)
+
+    hurst_val = 0.5
+    if returns_30 is not None and len(returns_30) >= 20:
+        hurst_val = calculate_hurst(returns_30)
+    hurst_score = _normalize(0.9 - hurst_val, 0, 0.6)
+
+    fund_rate = funding.get("funding_rate", 0.0) if funding else 0.0
+    fund_score = min(1.0, abs(fund_rate) * 400)
+
+    score = 0.35 * bb_score + 0.25 * adx_score + 0.25 * hurst_score + 0.15 * fund_score
+    return round(max(0.0, min(1.0, score)), 3)
+
+
+def classify_regime(score: float, prev_mode: str) -> str:
+    """
+    基于连续分数和滞后逻辑输出离散市场模式。
+    """
+    th = {
+        "trend_to_osc":   getattr(CFG, "regime_thresh_trend_to_osc",   0.45),
+        "trend_to_aggr":  getattr(CFG, "regime_thresh_trend_to_aggr",  0.78),
+        "osc_to_trend":   getattr(CFG, "regime_thresh_osc_to_trend",   0.40),
+        "osc_to_aggr":    getattr(CFG, "regime_thresh_osc_to_aggr",   0.72),
+        "aggr_to_osc":    getattr(CFG, "regime_thresh_aggr_to_osc",   0.42),
+        "aggr_to_trend":  getattr(CFG, "regime_thresh_aggr_to_trend", 0.38),
+    }
+
+    if prev_mode == "震荡激进":
+        if score > th["aggr_to_osc"]:
+            return "震荡"
+        elif score > th["aggr_to_trend"]:
+            return "趋势"
+        else:
+            return "震荡激进"
+    elif prev_mode == "震荡":
+        if score > th["osc_to_aggr"]:
+            return "震荡激进"
+        elif score > th["osc_to_trend"]:
+            return "趋势"
+        else:
+            return "震荡"
+    else:
+        if score > th["trend_to_aggr"]:
+            return "震荡激进"
+        elif score > th["trend_to_osc"]:
+            return "震荡"
+        else:
+            return "趋势"
+
+
 class SignalsModule:
     """指标计算、数据获取、规则引擎模块"""
 
@@ -829,6 +1037,7 @@ class SignalsModule:
         self._ind_15m_cache: Dict[str, Any] = {}
         self._atr_history: List[float] = []
         self._raw_kline_cache: Dict[str, tuple] = {}  # (data, fetch_ts, last_ts)
+        self._breakout_history: deque = deque(maxlen=3)  # [{breakout: bool, vol_surge: float}]
 
     def fetch_data(self, bar: str, limit: int = None, symbol: str = None) -> Optional[list]:
         """获取K线数据"""
@@ -886,11 +1095,13 @@ class SignalsModule:
         return ind_15m, ind_1h, ind_4h
 
     def evaluate_rules(self, ind_15m: Dict, price: float, prev_indicators: Dict = None,
-                      market_mode: str = "趋势", key_levels: Dict = None) -> Dict:
+                      market_mode: str = "趋势", key_levels: Dict = None,
+                      depth: Dict = None, vs_status: Dict = None) -> Dict:
         """
         规则引擎主评估函数。
         使用布林带、RSI、成交量等确定性规则快速评估市场状态。
         明确信号（超买超卖）直接返回，无需触发AI。
+        新增：信号强度分级（Scheme B），S/A 级信号绕过 ConvictionScore/AI/委员会/贝叶斯。
         """
         if ind_15m is None or not ind_15m.get("_valid"):
             return {"trigger_ai": True, "signal_type": "hold", "confidence": 0.5, "reason": "数据无效，触发AI"}
@@ -900,6 +1111,8 @@ class SignalsModule:
         bb_pct = ind_15m.get("bb_pct", 0.5)
         rsi = ind_15m.get("rsi", 50)
         vol_surge = ind_15m.get("vol_surge", 1.0)
+        adx = ind_15m.get("adx", 20)
+        regime_score = ind_15m.get("regime_score", 0.5)
 
         prev_rsi = (prev_indicators or {}).get("rsi") if prev_indicators else None
 
@@ -909,26 +1122,151 @@ class SignalsModule:
         # 规则2：RSI阈值检测
         rsi_trigger, rsi_signal = self._eval_rsi_rule(rsi, prev_rsi)
 
+        # ADX弱趋势过滤
+        if adx < 18 and not bb_trigger and not rsi_trigger:
+            return {"trigger_ai": True, "signal_type": "hold", "confidence": 0.5, "reason": "ADX<18 弱趋势，交给AI"}
+
         # 规则3：成交量放量检测
         vol_trigger, vol_signal = self._eval_volume_rule(vol_surge)
 
-        # 综合评估：任一规则给出明确信号则 bypass AI
-        # 修复：confidence 改为动态计算，反映信号强度差异
-        if not bb_trigger:
-            # 布林带：根据偏离 BB 轨道的程度给分（0.65~0.85）
-            _bb_extreme = max(abs(price / bb_upper - 1.0), abs(price / bb_lower - 1.0)) if bb_lower > 0 else 0
-            bb_conf = min(0.85, 0.65 + _bb_extreme * 15)
-            return {"trigger_ai": False, "signal_type": bb_signal, "confidence": round(bb_conf, 3), "reason": f"布林带{bbsignal_to_reason(bb_signal)}"}
-        if not rsi_trigger:
-            # RSI：根据极端程度给分（0.60~0.80）
-            rsi_conf = min(0.80, 0.60 + abs(rsi - 50) / 50 * 0.3)
-            return {"trigger_ai": False, "signal_type": rsi_signal, "confidence": round(rsi_conf, 3), "reason": f"RSI{rsi_signal_to_reason(rsi_signal, rsi)}"}
-        if not vol_trigger:
-            # 放量：根据 vol_surge 倍数给分（0.60~0.80）
-            vol_conf = min(0.80, 0.55 + (vol_surge - 1.0) * 0.1)
-            return {"trigger_ai": False, "signal_type": vol_signal, "confidence": round(vol_conf, 3), "reason": f"成交量异常放量{vol_surge:.1f}x"}
+        # ── 信号强度分级（Scheme B）──
+        _rule_action, _rule_conf, _rule_reason = None, 0.0, ""
+        _signal_from_bb = False  # 标记信号来源，区分 BB regime 过滤
 
-        return {"trigger_ai": True, "signal_type": "hold", "confidence": 0.5, "reason": "无明确规则信号，触发AI决策"}
+        # 确定主触发信号
+        if not bb_trigger:
+            # ── BB 信号 + regime 趋势过滤 ──
+            _bb_extreme = max(abs(price / bb_upper - 1.0), abs(price / bb_lower - 1.0)) if bb_lower > 0 else 0
+            _bb_sig = bb_signal
+
+            if regime_score < 0.45:
+                # 强震荡 → BB 信号几乎都是假突破或逆势，直接降级走 AI
+                return {
+                    "trigger_ai": True,
+                    "signal_type": "hold",
+                    "confidence": 0.5,
+                    "reason": f"BB信号({_bb_sig}) 但 regime={regime_score:.2f}<0.45，强震荡，交给AI"
+                }
+            elif regime_score < 0.55:
+                # 中性震荡 → BB 可以出，但置信度上限严格限制，必须走完整AI
+                _rule_conf = min(0.60, 0.55 + _bb_extreme * 10)
+                _rule_action = _bb_sig
+                _rule_reason = f"BB{_bb_sig} | regime={regime_score:.2f} 中性，限conf≤0.60"
+                _signal_from_bb = True
+            else:
+                # 趋势市 → 允许正常直出
+                _rule_conf = min(0.82, 0.65 + _bb_extreme * 15)
+                _rule_action = _bb_sig
+                _rule_reason = f"BB{_bb_sig} | regime={regime_score:.2f} 趋势确认"
+                _signal_from_bb = True
+
+        elif not rsi_trigger:
+            _rule_action = rsi_signal
+            _rule_conf = min(0.80, 0.60 + abs(rsi - 50) / 50 * 0.3)
+            _rule_reason = f"RSI{rsi_signal_to_reason(rsi_signal, rsi)}"
+        elif not vol_trigger:
+            _rule_action = vol_signal
+            _rule_conf = min(0.80, 0.55 + (vol_surge - 1.0) * 0.1)
+            _rule_reason = f"成交量异常放量{vol_surge:.1f}x"
+        else:
+            # 无触发，走 AI
+            return {"trigger_ai": True, "signal_type": "hold", "confidence": 0.5, "reason": "无明确规则信号，触发AI决策"}
+
+        # ── 优化1：趋势反向拦截（强趋势中不做逆势均值回归）──
+        _trend_counter = False
+        if _rule_action == "short" and regime_score >= 0.65:
+            _trend_counter = True
+        elif _rule_action == "long" and regime_score <= 0.35:
+            _trend_counter = True
+        if _trend_counter:
+            log.info(f"🚧 [规则引擎] {_rule_action} 与趋势方向相反（regime={regime_score:.2f}），降级为 trigger_ai=True")
+            return {"trigger_ai": True, "signal_type": "hold", "confidence": 0.5,
+                    "reason": f"趋势反向拦截(regime={regime_score:.2f})，交AI综合判断"}
+
+        # ── VSpike 方向硬拦截（分层处理）──
+        _vs = vs_status or {}
+        _vs_mult = _vs.get("mult", 0.0)
+        _vs_dir = _vs.get("direction", "")
+        _vs_buy_pct = _vs.get("buy_pct", 0.5)
+
+        if _vs_mult >= 5.0 and _rule_action in ("open_long", "open_short"):
+            _is_conflict = False
+            if _rule_action == "open_long":
+                if _vs_mult >= 8.0 and _vs_buy_pct < 0.55:      # 极端量能：零容忍
+                    _is_conflict = True
+                elif _vs_buy_pct < 0.40:                         # 中等量能：适度宽松
+                    _is_conflict = True
+            elif _rule_action == "open_short":
+                if _vs_mult >= 8.0 and _vs_buy_pct > 0.45:
+                    _is_conflict = True
+                elif _vs_buy_pct > 0.60:
+                    _is_conflict = True
+
+            if _is_conflict:
+                if _vs_mult >= 8.0:
+                    log.warning(
+                        f"🚫 [规则引擎|VSpike硬拦截] {_rule_action} 被极端量能拦截"
+                        f"（mult={_vs_mult:.1f}x, buy={_vs_buy_pct:.0%}，方向{_vs_dir}）"
+                    )
+                    return {
+                        "trigger_ai": True,
+                        "signal_type": "hold",
+                        "confidence": 0.4,
+                        "reason": f"VSpike {_vs_mult:.1f}x 方向硬冲突，强制 hold"
+                    }
+                else:
+                    log.info(
+                        f"⚠️ [规则引擎|VSpike分层拦截] {_rule_action} 量能冲突"
+                        f"（mult={_vs_mult:.1f}x, buy={_vs_buy_pct:.0%}），降级走AI限conf≤0.55"
+                    )
+                    return {
+                        "trigger_ai": False,
+                        "signal_type": _rule_action,
+                        "confidence": 0.55,
+                        "reason": f"VSpike {_vs_mult:.1f}x 方向冲突，限conf≤0.55 走AI",
+                        "signal_strength": "C"
+                    }
+
+        # 多因子确认计数
+        _factors = 0
+        if not bb_trigger or not rsi_trigger:
+            _factors += 1  # BB 或 RSI 至少一个触发
+        # ── 优化2：VSpike 方向性判断（反向放量不加分，同向放量才加分）──
+        _vs = vs_status or {}
+        _vs_mult_v = _vs.get("mult", 0.0)
+        _vs_dir_v = _vs.get("direction", "")
+        _vs_buy_pct_v = _vs.get("buy_pct", 0.5)
+        _vol_aligned = False
+        if _vs_mult_v >= 2.5:
+            if _rule_action == "long" and (_vs_dir_v == "买方主导" or _vs_buy_pct_v >= 0.60):
+                _factors += 1  # 买方放量确认做多
+            elif _rule_action == "short" and (_vs_dir_v == "卖方主导" or _vs_buy_pct_v <= 0.40):
+                _factors += 1  # 卖方放量确认做空
+            # 反向放量不加分
+        # ── 优化3：OB 失衡阈值收紧（0.25→0.35）──
+        _ob_imb = depth.get("imbalance", 0) if depth else 0.0
+        if _rule_action == "long" and _ob_imb > 0.35:
+            _factors += 1  # 买盘失衡
+        elif _rule_action == "short" and _ob_imb < -0.35:
+            _factors += 1  # 卖盘失衡
+        # 趋势同向也计入因子（regime_score > 0.55 或 ADX >= 22）
+        _trend_aligned = regime_score >= 0.55 or adx >= 22
+        if _trend_aligned:
+            _factors += 1  # 趋势方向与信号一致
+
+        # S 级：4 因子全满足，直出执行
+        if _factors >= 4:
+            _rule_conf = max(_rule_conf, 0.82)
+            return {"trigger_ai": False, "signal_type": _rule_action, "confidence": round(_rule_conf, 3),
+                    "reason": f"S级直出|{_rule_reason}", "signal_strength": "S"}
+        # A 级：至少 3 因子
+        elif _factors >= 3:
+            _rule_conf = max(_rule_conf, 0.75)
+            return {"trigger_ai": False, "signal_type": _rule_action, "confidence": round(_rule_conf, 3),
+                    "reason": f"A级|{_rule_reason}", "signal_strength": "A"}
+
+        return {"trigger_ai": False, "signal_type": _rule_action, "confidence": round(_rule_conf, 3),
+                "reason": _rule_reason, "signal_strength": "B"}
 
     def _eval_bollinger_band_rule(self, price: float, bb_upper: float, bb_lower: float, bb_pct: float) -> Tuple[bool, str]:
         if bb_upper <= 0 or bb_lower <= 0:
@@ -942,7 +1280,7 @@ class SignalsModule:
         return True, "hold"
 
     def _eval_rsi_rule(self, rsi: float, prev_rsi: float = None) -> Tuple[bool, str]:
-        if rsi >= 75:
+        if rsi >= 78:
             return False, "short"
         if rsi <= 25:
             return False, "long"
@@ -998,6 +1336,18 @@ class SignalsModule:
         if market_mode == "震荡激进":
             vol_threshold = max(vol_threshold, 2.0)
 
+        # ── 假突破过滤：连续 2 帧突破但 vol_surge < 1.8x → 降级 ──
+        _recent = self._breakout_history
+        _fake_breakout_count = sum(
+            1 for h in _recent if h.get("breakout") and h.get("vol_surge", 0) < 1.8
+        )
+        if _fake_breakout_count >= 2:
+            # 最近多帧突破但量能不济 → 视为假突破信号，降低当前置信度
+            log.debug(
+                f"🔇 [假突破过滤] 最近{_fake_breakout_count}帧突破但量能不足(vol<1.8x)，"
+                f"当前 {direction} 突破降级"
+            )
+
         recent_high = max(highs[-params["period"]:])
         recent_low = min(lows[-params["period"]:])
 
@@ -1007,6 +1357,10 @@ class SignalsModule:
                     sl = current_price - atr * sl_atr_mult
                     reason = f"突破{params['period']}高點+放量{vol_ratio:.1f}x"
                     confidence = min(0.60 + (vol_ratio - vol_threshold) * 0.05, 0.80)
+                    if _fake_breakout_count >= 2:
+                        confidence = max(0.35, confidence - 0.15)
+                        reason += f" | 假突破预警(-0.15)"
+                    self._breakout_history.append({"breakout": True, "vol_surge": vol_ratio})
                     return {"breakout": True, "confidence": confidence, "reason": reason, "sl": sl, "atr": atr}
         else:
             if current_price < recent_low and current_price < closes[-2]:
@@ -1014,8 +1368,13 @@ class SignalsModule:
                     sl = current_price + atr * sl_atr_mult
                     reason = f"跌破{params['period']}低點+放量{vol_ratio:.1f}x"
                     confidence = min(0.60 + (vol_ratio - vol_threshold) * 0.05, 0.80)
+                    if _fake_breakout_count >= 2:
+                        confidence = max(0.35, confidence - 0.15)
+                        reason += f" | 假突破预警(-0.15)"
+                    self._breakout_history.append({"breakout": True, "vol_surge": vol_ratio})
                     return {"breakout": True, "confidence": confidence, "reason": reason, "sl": sl, "atr": atr}
 
+        self._breakout_history.append({"breakout": False, "vol_surge": vol_ratio})
         return {"breakout": False}
 
     def _filter_raw_klines_flash_crash(self, raw_klines: list) -> list:
