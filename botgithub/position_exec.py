@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 # ── 共享基础设施（common.py）──────────────────────────────────────────────
 from common import (
-    CFG, log, _webhook, gs_get, gs_set, gs_increment, gs_add,
+    CFG, log, _webhook, gs_get, gs_set, gs_increment,
     UTC, log_event, log_kelly_metrics, kelly_optimal_size, _call_chat,
     get_db_conn, SYSTEM_PROMPT_RISK,
 )
@@ -52,7 +52,7 @@ def calc_liq_price(side: str, entry: float, leverage: int, balance: float,
     """
     if entry <= 0 or leverage <= 0:
         return 0.0
-    mmr = 0.004       # 维持保证金率 0.4%
+    mmr = CFG.maintenance_margin_rate  # OKX 永续合约维持保证金率 0.4%
     buffer = 0.001    # 额外缓冲 0.1%，覆盖手续费和滑点
     if side == "long":
         return entry * (1 - (1 - mmr + buffer) / leverage)
@@ -72,13 +72,11 @@ class PositionExec:
     def __init__(self, trader):
         self.trader = trader
         self.okx = trader.trader  # OkxTrader 快捷引用
-        # ConvictionScore 拒绝标志：由 _calc_size_and_margin 设置，_do_open 传递到 _run_symbol
-        self._cv_rejected = False
-        self._cv_rejected_score = 0.0
-        self._cv_rejected_action = ""
         # 算法单去重：记录上次成功提交的 SL/TP，避免相同值反复撤单重挂
         self._last_submitted_sl = 0.0
         self._last_submitted_tp = 0.0
+        # 平仓竞态保护：防止双线程并发调用 _close 浪费 API 调用
+        self._close_in_flight = False
 
     def _do_light_adjust(self, sym: str):
         """
@@ -363,6 +361,14 @@ class PositionExec:
             log.info(f"⛔ [{sym}] 加仓[{idx+1}]累计风险 ${cumulative_risk:.2f} > 动态上限 ${max_risk_budget:.2f}，跳过")
             return
 
+        # 日风险上限校验：首单 + 本次加仓 ≤ max_daily_risk_pct × 权益
+        _today_risk = float(gs_get("today_opened_risk", 0.0))
+        _equity = self.trader.latest_equity if self.trader.latest_equity > 0 else bal
+        _daily_cap = _equity * CFG.max_daily_risk_pct
+        if _today_risk + add_risk_usd > _daily_cap:
+            log.info(f"⛔ [{sym}] 加仓[{idx+1}]日风险上限: 今日已用{_today_risk:.2f}U + 本次{add_risk_usd:.2f}U > 日上限{_daily_cap:.2f}U，跳过")
+            return
+
         # 保证金使用率校验
         lev          = pos_leverage if pos_leverage > 0 else 1
         cur_margin   = pos_size * ct_val * pos_entry / lev
@@ -584,8 +590,8 @@ class PositionExec:
 
     def _calc_size_and_margin(self, dec: Dict, price: float, bal: float, atr: float,
                                is_long: bool, sym: str, market_mode: str, ind_15m: Dict,
-                               risk_mult: float = 1.0, committee_opposing: int = 0,
-                               action: str = "", depth: Dict = None, trend_score: float = 0.5) -> Dict:
+                               risk_mult: float = 1.0, action: str = "", depth: Dict = None,
+                               trend_score: float = 0.5, slip_risk_mult: float = 1.0) -> Dict:
         """
         计算最优开仓张数和所需保证金（Kelly 公式 + 动态风控）。
         返回结构包含 skip 标志和完整仓位参数。
@@ -612,7 +618,7 @@ class PositionExec:
             _floor, _cap = CFG.sl_atr_floor_osc_aggr, CFG.sl_atr_cap_osc_aggr
         elif market_mode == "震荡":
             # 高置信留更多呼吸空间，防止频繁扫损
-            _base = 1.6 if ai_conf >= 0.65 else 1.4
+            _base = 2.0 if ai_conf >= 0.65 else 1.6
             _floor, _cap = CFG.sl_atr_floor_osc, CFG.sl_atr_cap_osc
         else:  # 趋势市
             _base = CFG.sl_atr_mult
@@ -705,7 +711,7 @@ class PositionExec:
 
         # 小资金保证金使用率保护：低于150U时收紧上限，留足缓冲防强平
         if effective_bal < 150:
-            effective_max_margin = 0.48
+            effective_max_margin = 0.65
             log.warning(f"🛡️ [{sym}] 小资金保护: effective_bal={effective_bal:.1f}U <150, 保证金上限收紧至 {effective_max_margin*100:.0f}%")
         else:
             effective_max_margin = CFG.max_total_margin_ratio
@@ -727,8 +733,8 @@ class PositionExec:
         # ── Kelly 上限：小资金低胜率保护 ──────────────────────────────────
         _recent_wr = float(gs_get("last_24h_win_rate", 0.5))
         if effective_bal < 150 and _recent_wr < 0.52:
-            _kelly_cap = 0.55
-            log.debug(f"🛡️ [{sym}] 小资金低胜率保护: 胜率={_recent_wr:.2f} → Kelly上限=0.55")
+            _kelly_cap = 0.75
+            log.debug(f"🛡️ [{sym}] 小资金低胜率保护: 胜率={_recent_wr:.2f} → Kelly上限=0.75")
         else:
             _kelly_cap = CFG.kelly_max_f
         # ── 强信号动态 Kelly 上浮机制 ─────────────────────────────────────────
@@ -743,10 +749,6 @@ class PositionExec:
             log.debug(f"🚀 [{sym}] 强信号 Kelly 上浮: {CFG.kelly_fraction:.2f} → {kelly_base:.2f} (conf={ai_conf:.2f} p_win={p_win:.2f} mode={market_mode})")
         kelly_f = kelly_optimal_size(p_win, b, kelly_base)
         kelly_f = min(kelly_f, _kelly_cap)  # 应用 Kelly 上限（含胜率保护）
-        # 委员会强烈反对时（≥2 票反对 且 AI conf < 0.7），Kelly 折扣 50%
-        if committee_opposing >= 2 and ai_conf < 0.7:
-            kelly_f *= 0.5
-            log.warning(f"⚠️ [{sym}] 委员会反对{committee_opposing}票，Kelly 折扣 50% → kelly_f={kelly_f:.3f}")
 
         # 初始化默认值（满仓模式不走 Kelly，但仍需返回值有默认值）
         slippage_mult = 1.0
@@ -770,6 +772,10 @@ class PositionExec:
             # 滑点熔断作为链中最后一环，追加到 risk_mult
             slippage_mult = 0.5 if self.okx.get_hourly_avg_slippage(sym) > CFG.slippage_fuse_avg_thresh else 1.0
             effective_risk_mult = min(risk_mult, 1.0)  # 禁止 risk_mult 放大 Kelly
+            # ── 滑点自适应降仓位（高ATR/VSpike时由 eth_trader 传入 ×0.7）──
+            if slip_risk_mult < 1.0:
+                effective_risk_mult = round(effective_risk_mult * slip_risk_mult, 4)
+                log.info(f"🌊 [{sym}] 滑点自适应降仓: risk_mult×{slip_risk_mult} → effective={effective_risk_mult:.4f}")
 
             # ── 三因子联动 Kelly 倍数：胜率 × 回撤 × 市场模式 ─────────────────
             _win_rate  = gs_get("last_24h_win_rate", 0.5)
@@ -784,85 +790,131 @@ class PositionExec:
                 log.debug(f"📊 [{sym}] Kelly三因子: 胜率={_win_rate:.2f} 回撤={_dd_factor:.2f} 趋势={market_mode} → ×{_dd_mult:.2f}")
 
             # ── ConvictionScorer：软打分（取代硬阈值 AND 门）──────────────
-            # 优先使用 AI 决策时预计算的 VSpike 分数（含方向检查 + bonus），直接复用不做重算
-            _vs_score_mult = dec.get("_vs_score_mult_frozen", 0.0)
-            # 检查过期时间（90s），避免使用已失效的 Spike 数据
-            _vs_frozen_ts = dec.get("_vs_score_mult_frozen_ts", 0.0)
-            if _vs_frozen_ts > 0 and (time.monotonic() - _vs_frozen_ts) > 90.0:
-                _vs_score_mult = 0.0  # 过期清除
-            # 修复：冻结值过期或为 0 时，回退到实时 VSpike 状态
-            if _vs_score_mult == 0.0:
-                _vs_live = self.trader.vspike.get_status()
-                if _vs_live.get("is_spike") or _vs_live.get("spike_recent"):
-                    _vs_score_mult = _vs_live.get("mult", 0.0)
+            if not dec.get("force_bypass_cv", False):
+                # 优先复用开仓前预计算的 ConvictionScore（避免两次计算不一致）
+                _cv_frozen = dec.get("_cv_score_frozen", 0.0)
+                _cv_frozen_ts = dec.get("_cv_score_frozen_ts", 0.0)
+                _expired = _cv_frozen_ts > 0 and (time.monotonic() - _cv_frozen_ts) > 90.0
+                if _expired:
+                    _cv_frozen = 0.0
 
-            _near_level  = False
-            if ind_15m:
-                _price_cs = ind_15m.get("price", price)
-                _sup = ind_15m.get("support", 0)
-                _res = ind_15m.get("resistance", 0)
-                if _sup > 0 and abs(_price_cs - _sup) / _price_cs < 0.003:
-                    _near_level = True
-                if _res > 0 and abs(_price_cs - _res) / _price_cs < 0.003:
-                    _near_level = True
+                if _cv_frozen > 0:
+                    # 复用预计算分数，跳过 ConvictionScorer 重算
+                    _cv_score = _cv_frozen
+                    # 但保留 Kelly 和 components 的实时计算（依赖当前市场状态）
+                    _vs_score_mult = dec.get("_vs_score_mult_frozen", 0.0)
+                    _vs_frozen_ts_cv = dec.get("_vs_score_mult_frozen_ts", 0.0)
+                    if _vs_frozen_ts_cv > 0 and (time.monotonic() - _vs_frozen_ts_cv) > 90.0:
+                        _vs_score_mult = 0.0
+                    if _vs_score_mult == 0.0:
+                        _vs_live_cv = self.trader.vspike.get_status()
+                        if _vs_live_cv.get("is_spike") or _vs_live_cv.get("spike_recent"):
+                            _vs_score_mult = _vs_live_cv.get("mult", 0.0)
+                    _near_level = False
+                    if ind_15m:
+                        _price_cs = ind_15m.get("price", price)
+                        _sup = ind_15m.get("support", 0)
+                        _res = ind_15m.get("resistance", 0)
+                        if _sup > 0 and abs(_price_cs - _sup) / _price_cs < 0.003:
+                            _near_level = True
+                        if _res > 0 and abs(_price_cs - _res) / _price_cs < 0.003:
+                            _near_level = True
+                    _vs_live_ctx = self.trader.vspike.get_status()
+                    _conviction = self.trader._conviction.score(
+                        ai_conf      = ai_conf,
+                        action       = dec.get("action", "open_long"),
+                        vspike_mult  = _vs_score_mult,
+                        ob_imbalance = depth.get("imbalance", 0.0) if hasattr(depth, "get") else 0.0,
+                        rsi          = ind_15m.get("rsi", 50.0) if ind_15m else 50.0,
+                        at_key_level = _near_level,
+                        market_mode  = market_mode,
+                        context      = {
+                            "atr_ratio": (ind_15m or {}).get("atr_ratio", 1.0),
+                            "trend_alignment_score": trend_score,
+                            "flow_direction": _vs_live_ctx.get("direction", ""),
+                            "cvd_delta": _vs_live_ctx.get("cum_delta", 0.0),
+                            "buy_pct": _vs_live_ctx.get("buy_pct", 0.5),
+                        },
+                    )
+                    _cv_kelly      = _conviction["kelly_ratio"]
+                    _cv_components = _conviction["components"]
+                    log.debug(f"🔒 [{sym}] ConvictionScore 复用预计算分数={_cv_score:.1f}（_calc_size_and_margin 重算 Kelly）")
+                else:
+                    # 无预计算分数，完整重算 ConvictionScore
+                    _vs_score_mult = dec.get("_vs_score_mult_frozen", 0.0)
+                    _vs_frozen_ts_cv = dec.get("_vs_score_mult_frozen_ts", 0.0)
+                    if _vs_frozen_ts_cv > 0 and (time.monotonic() - _vs_frozen_ts_cv) > 90.0:
+                        _vs_score_mult = 0.0
+                    if _vs_score_mult == 0.0:
+                        _vs_live_cv = self.trader.vspike.get_status()
+                        if _vs_live_cv.get("is_spike") or _vs_live_cv.get("spike_recent"):
+                            _vs_score_mult = _vs_live_cv.get("mult", 0.0)
+                    _near_level = False
+                    if ind_15m:
+                        _price_cs = ind_15m.get("price", price)
+                        _sup = ind_15m.get("support", 0)
+                        _res = ind_15m.get("resistance", 0)
+                        if _sup > 0 and abs(_price_cs - _sup) / _price_cs < 0.003:
+                            _near_level = True
+                        if _res > 0 and abs(_price_cs - _res) / _price_cs < 0.003:
+                            _near_level = True
+                    _vs_live_ctx = self.trader.vspike.get_status()
+                    _conviction = self.trader._conviction.score(
+                        ai_conf      = ai_conf,
+                        action       = dec.get("action", "open_long"),
+                        vspike_mult  = _vs_score_mult,
+                        ob_imbalance = depth.get("imbalance", 0.0) if hasattr(depth, "get") else 0.0,
+                        rsi          = ind_15m.get("rsi", 50.0) if ind_15m else 50.0,
+                        at_key_level = _near_level,
+                        market_mode  = market_mode,
+                        context      = {
+                            "atr_ratio": (ind_15m or {}).get("atr_ratio", 1.0),
+                            "trend_alignment_score": trend_score,
+                            "flow_direction": _vs_live_ctx.get("direction", ""),
+                            "cvd_delta": _vs_live_ctx.get("cum_delta", 0.0),
+                            "buy_pct": _vs_live_ctx.get("buy_pct", 0.5),
+                        },
+                    )
+                    _cv_score      = _conviction["score"]
+                    _cv_kelly      = _conviction["kelly_ratio"]
+                    _cv_components = _conviction["components"]
 
-            # 获取实时 VSpike 状态，传入 ConvictionScorer 供极端保底分判断
-            _vs_live_ctx = self.trader.vspike.get_status()
-            _conviction = self.trader._conviction.score(
-                ai_conf      = ai_conf,
-                action       = dec.get("action", "open_long"),
-                vspike_mult  = _vs_score_mult,
-                ob_imbalance = depth.get("imbalance", 0.0) if hasattr(depth, "get") else 0.0,
-                rsi          = ind_15m.get("rsi", 50.0) if ind_15m else 50.0,
-                at_key_level = _near_level,
-                market_mode  = market_mode,
-                context      = {
-                    "atr_ratio": (ind_15m or {}).get("atr_ratio", 1.0),
-                    "trend_alignment_score": trend_score,
-                    "flow_direction": _vs_live_ctx.get("direction", ""),
-                    "cvd_delta": _vs_live_ctx.get("cum_delta", 0.0),
-                    "buy_pct": _vs_live_ctx.get("buy_pct", 0.5),
-                },
-            )
-            _cv_score      = _conviction["score"]
-            _cv_kelly      = _conviction["kelly_ratio"]
-            _cv_components = _conviction["components"]
+                log.info(
+                    f"🎯 [{sym}] [Entry] Score={_cv_score} | "
+                    f"Components: AI({_cv_components.get('ai_raw', 0)}) + "
+                    f"Spike({_cv_components.get('spike', 0)}) + "
+                    f"OB({_cv_components.get('ob', 0)}) + "
+                    f"Levels({_cv_components.get('level', 0)}) + "
+                    f"RSI({_cv_components.get('rsi_penalty', 0)}) | "
+                    f"Kelly_Adj={_cv_kelly:.2f}"
+                )
 
-            log.info(
-                f"🎯 [{sym}] [Entry] Score={_cv_score} | "
-                f"Components: AI({_cv_components.get('ai_raw', 0)}) + "
-                f"Spike({_cv_components.get('spike', 0)}) + "
-                f"OB({_cv_components.get('ob', 0)}) + "
-                f"Levels({_cv_components.get('level', 0)}) + "
-                f"RSI({_cv_components.get('rsi_penalty', 0)}) | "
-                f"Kelly_Adj={_cv_kelly:.2f}"
-            )
-
-            # ── 方案 C：VSpike 条件性阈值 ─────────────────────────────────────
-            # VSpike 越强，阈值越低，允许边缘信号在高成交量确认时下注
-            _base_thresh = CFG.osc_conviction_min if market_mode in ("震荡", "震荡激进") else CFG.conviction_open_min
-            if _vs_score_mult >= 6.0:
-                _cv_thresh = max(40.0, _base_thresh - 12.0)  # VSpike≥6x：阈值 -12
-            elif _vs_score_mult >= 4.0:
-                _cv_thresh = max(43.0, _base_thresh - 8.0)   # VSpike≥4x：阈值 -8（震荡市实际47→39，已验证太松）
-            elif _vs_score_mult >= 3.0:
-                _cv_thresh = max(45.0, _base_thresh - 4.0)   # VSpike≥3x：阈值 -4
+                # ── ConvictionScore 降级为参考指标：记录分数，不再作为硬门槛拦截 ──
+                _base_thresh = CFG.osc_conviction_min if market_mode in ("震荡", "震荡激进") else CFG.conviction_open_min
+                if _vs_score_mult >= 6.0:
+                    _cv_thresh = max(48.0, _base_thresh - 8.0)
+                elif _vs_score_mult >= 4.0:
+                    _cv_thresh = max(50.0, _base_thresh - 6.0)
+                elif _vs_score_mult >= 3.0:
+                    _cv_thresh = max(52.0, _base_thresh - 4.0)
+                else:
+                    _cv_thresh = _base_thresh
+                if _cv_score < _cv_thresh:
+                    log.warning(
+                        f"⚠️ [{sym}] [ConvictionScore参考] Score={_cv_score:.1f} < {_cv_thresh:.1f}（"
+                        f"{'震荡' if market_mode in ('震荡', '震荡激进') else '趋势'}市阈值），"
+                        f"作为参考指标记录，不拦交易"
+                    )
+                else:
+                    log.info(
+                        f"✅ [{sym}] ConvictionScore={_cv_score:.1f} ≥ {_cv_thresh:.1f}（"
+                        f"{'震荡' if market_mode in ('震荡', '震荡激进') else '趋势'}市），通过"
+                    )
+                # ────────────────────────────────────────────────────────────────
             else:
-                _cv_thresh = _base_thresh                     # 无 VSpike：基准阈值
-            # ────────────────────────────────────────────────────────────────
-
-            if _cv_score < _cv_thresh:
-                log.info(f"🚫 [{sym}] ConvictionScore={_cv_score:.1f} < {_cv_thresh}（{'震荡' if market_mode in ('震荡', '震荡激进') else '趋势'}市），跳过开仓")
-                # 记录 ConvictionScore 拒绝的决策，供 _do_open 传递到 _run_symbol
-                self._cv_rejected = True
-                self._cv_rejected_score = _cv_score
-                self._cv_rejected_action = dec.get("action", "")
-                return {"skip": True, "size": 0, "sl": sl, "tp": tp, "risk_per_trade_dynamic": 0.0,
-                        "calc": {"kelly_p_win": p_win, "kelly_b": b, "kelly_f": kelly_f,
-                                 "kelly_risk_mult": risk_mult, "conviction_score": _cv_score,
-                                 "kelly_slippage_mult": slippage_mult,
-                                 "risk_per_trade_dynamic": 0.0, "kelly_risk_budget": 0,
-                                 "posterior_confidence": p_win}}
+                # 规则引擎快速路径（Fast AI 已校验通过）：跳过 ConvictionScore，直进简化 Kelly
+                log.info(f"⚡ [{sym}] 规则引擎快速路径：跳过 ConvictionScore，直进简化 Kelly 计算")
+                _cv_kelly = dec.get("kelly_override", 1.0)
 
             # ── 去重复惩罚：ConvictionScore 的 _arbitrate_final_score 已包含
             #    env_mult(trend_score+ATR) 和 risk_mult(回撤×胜率×连亏)，
@@ -896,6 +948,34 @@ class PositionExec:
             daily_cap  = effective_bal * CFG.max_daily_risk_pct
             log.debug(f"📊 [{sym}] 今日已用风险: {today_risk:.2f}U / {daily_cap:.2f}U（统计用，不拦截）")
             log.debug(f"🎯 [{sym}] Kelly链: p_win={p_win:.3f} b={b:.2f} kelly_f={kelly_f:.3f} risk_mult={risk_mult:.3f} slippage_mult={slippage_mult:.1f} final_risk={final_risk_mult:.4f} budget={risk_budget:.2f}U")
+
+            # ── 风险参数有效性检查：防止 Kelly=0 或 SL 过近时强制开 1 张 ──────
+            if dist <= 0 or risk_budget <= 0:
+                log.warning(
+                    f"⚠️ [{sym}] 风险参数无效 (dist={dist:.4f}, risk_budget={risk_budget:.2f})，"
+                    f"可能原因：SL过近或Kelly为0，拒绝开仓"
+                )
+                return {
+                    "skip": True,
+                    "size": 0,
+                    "sl": sl,
+                    "tp": tp,
+                    "risk_per_trade_dynamic": risk_per_trade_dynamic,
+                    "calc": {
+                        "kelly_p_win": p_win,
+                        "kelly_b": b,
+                        "kelly_f": kelly_f,
+                        "kelly_risk_mult": risk_mult,
+                        "conviction_score": _cv_score,
+                        "kelly_slippage_mult": slippage_mult,
+                        "risk_per_trade_dynamic": risk_per_trade_dynamic,
+                        "kelly_risk_budget": risk_budget,
+                        "posterior_confidence": p_win,
+                        "atr": atr,
+                        "dist": dist,
+                    }
+                }
+
             raw_size = risk_budget / (dist * ct_val + 1e-9)
             if raw_size < 1.0:
                 overshoot_pct = (dist * ct_val - risk_budget) / (effective_bal + 1e-9) * 100
@@ -1002,7 +1082,6 @@ class PositionExec:
             "kelly_risk_mult": risk_mult,
             "kelly_slippage_mult": slippage_mult,
             "kelly_risk_budget": risk_budget,
-            "kelly_committee_opposing": committee_opposing,
             "posterior_confidence": p_win,  # 贝叶斯后验胜率，用于日志记录
         }
 
@@ -1152,7 +1231,23 @@ class PositionExec:
             pos.entry_atr_pct    = _entry_atr_pct
             pos.ai_confidence    = _ai_conf
             pos.ai_reason        = _ai_reason
+            # ==================== 【关键修复】追踪止损正确初始化 ====================
+            pos.peak_price            = price             # 关键！初始峰值 = 入场价
+            pos.trailing_active       = False             # 明确关闭，防止本轮立刻触发
+            pos.trailing_activate_ts  = 0.0               # 重置激活时间戳
+            # =====================================================================
             save_state_to_disk(pos)
+
+        # ── 开仓成功 → 重置连洗计数（不同价位开仓，旧记忆清除）──
+        if hasattr(self.trader, "_wash_count_at_price"):
+            if self.trader._wash_count_at_price > 0:
+                log.info(
+                    f"✅ [{sym}] 新仓开仓成功，重置连洗计数 "
+                    f"（原 count={self.trader._wash_count_at_price}）"
+                )
+            self.trader._wash_count_at_price = 0
+            self.trader._last_sl_price = 0.0
+            self.trader._last_sl_time = 0.0
 
         # ── 每日风险上限累计 ─────────────────────────────────────────────
         _fallback_ct = self.okx.contract_sizes.get(sym, 0.01)
@@ -1161,6 +1256,11 @@ class PositionExec:
             _ = gs_add("today_opened_risk", _opened_risk)
 
         trade_id = save_trade_open(decision_id, posSide, size, price, symbol=sym)
+
+        # ── 金字塔加仓前置检查：开仓瞬间立即评估第一步是否已触发 ─────────────
+        # 避免等待下一轮循环，提升响应速度
+        self._do_pyramid_add(sym)
+
         # 动态案例池：将 entry 市场快照写入 trades 表（用于后续案例生成）
         if trade_id and CFG.enable_auto_case_pool:
             try:
@@ -1232,23 +1332,19 @@ class PositionExec:
     def _do_open(self, dec: Dict, price: float, bal: float, atr: float, funding: Dict,
                  decision_id: int, risk_mult: float = 1.0, symbol: str = None,
                  market_mode: str = None, ind_15m: Dict = None, pyramid_plan: dict = None,
-                 committee_opposing: int = 0, depth: Dict = None,
-                 trend_score: float = 0.5):
+                 depth: Dict = None, trend_score: float = 0.5,
+                 news_sentiment: float = 0.0, fear_greed: int = 50,
+                 slip_risk_mult: float = 1.0):
         """
         三阶段锁策略协调器：[锁内]计算+预留 → [无锁]下单 → [锁内]同步状态
         不含任何具体计算逻辑，仅做流程编排 + 异常兜底。
         risk_mult: 统一风险因子链（Kelly * market * consec * dyn * pyramid），已在 _run_symbol 中合并完毕
         pyramid_plan: AI 制定的加仓计划（None = 不加仓）
-        committee_opposing: 策略委员会反对票数（≥2 且 AI conf<0.7 时 Kelly 折扣 50%）
         """
         sym = CFG.symbol
         is_long = "long" in dec.get("action", "")
         posSide = "long" if is_long else "short"
         _margin_to_release = 0.0
-        # 每次 _do_open 调用时重置 ConvictionScore 拒绝标志
-        self._cv_rejected = False
-        self._cv_rejected_score = 0.0
-        self._cv_rejected_action = ""
 
         try:
             # ── 阶段1：全局开仓锁，纯内存计算 ───────────────────────────────
@@ -1269,19 +1365,12 @@ class PositionExec:
                 calc = self._calc_size_and_margin(
                     dec, price, bal, atr, is_long, sym, market_mode or self.trader._market_mode, ind_15m,
                     risk_mult,  # 统一风险因子链（已在 _run_symbol 中合并 market*consec*dyn*pyramid）
-                    committee_opposing=committee_opposing,
                     action=dec.get("action", ""),
                     depth=depth,
                     trend_score=trend_score,
+                    slip_risk_mult=slip_risk_mult,
                 )
                 if calc.get("skip"):
-                    # ConvictionScore 拒绝：将拒绝信息传递给 trader，供 _run_symbol 处理
-                    if self._cv_rejected:
-                        self.trader._cv_rejected_decision = (
-                            self._cv_rejected_action,
-                            self._cv_rejected_score,
-                            time.monotonic(),
-                        )
                     return
 
                 _margin_to_release = self._pre_reserve(sym, calc["required_margin"])
@@ -1299,7 +1388,6 @@ class PositionExec:
                     size=calc["size"],
                     price=price,
                     decision_id=decision_id,
-                    committee_opposing=calc.get("kelly_committee_opposing", 0),
                     market_mode=market_mode or "",
                     posterior_confidence=calc.get("posterior_confidence", 0.5),
                     kelly_fraction=CFG.kelly_fraction,
@@ -1367,6 +1455,10 @@ class PositionExec:
         with lock:
             if not pos.side:
                 return
+            if self._close_in_flight:
+                log.debug(f"⏩ [{sym}] 平仓已在执行中，跳过（原因: {reason}）")
+                return
+            self._close_in_flight = True
             side_snapshot      = pos.side
             entry_snapshot     = pos.entry_price
             size_snapshot      = pos.size
@@ -1411,6 +1503,28 @@ class PositionExec:
                 gs_set("last_stop_reason", _stop_reason)
                 gs_set("last_stop_market_mode", _stop_mode)
                 gs_set("last_stop_price", sl_snapshot if sl_snapshot > 0 else exit_price)
+                # ── 同价位冷却 + 连续被洗记忆：记录止损价，更新连洗计数 ──
+                _sl_px = sl_snapshot if sl_snapshot > 0 else exit_price
+                if _sl_px > 0 and hasattr(self.trader, "_last_sl_price"):
+                    _prev_sl = self.trader._last_sl_price
+                    _prev_t = self.trader._last_sl_time
+                    if _prev_sl > 0:
+                        _prev_dist = abs(_sl_px - _prev_sl) / _prev_sl
+                        _prev_age = time.monotonic() - _prev_t
+                        # 同价位区间（±1%）且冷却期内（300s） → 连洗计数+1
+                        if _prev_dist <= 0.01 and _prev_age < 300:
+                            self.trader._wash_count_at_price += 1
+                            log.warning(
+                                f"🔄 [{sym}] 同价位连洗+1：当前={self.trader._wash_count_at_price}次 "
+                                f"（止损价 {_sl_px:.4f} vs 上次 {_prev_sl:.4f}，差{_prev_dist*100:.2f}%）"
+                            )
+                        else:
+                            # 不同价位或间隔久 → 重置
+                            self.trader._wash_count_at_price = 1
+                    else:
+                        self.trader._wash_count_at_price = 1
+                    self.trader._last_sl_price = _sl_px
+                    self.trader._last_sl_time = time.monotonic()
                 # 异步生成失败原因摘要（RAG闭环）
                 _trade_id_for_fail = pos.trade_id or 0
                 ctx = (
@@ -1515,6 +1629,9 @@ class PositionExec:
                 )
 
             log.info(f"✅ [{sym}] 平仓成功 | 原因: {reason} | 盈亏: {pnl_pct*100:.2f}%")
+            # ── 平仓后清除 AI 缓存，防止旧决策被 VSpike 特权通道等机制复用 ──
+            if hasattr(self.trader, '_clear_ai_cache'):
+                self.trader._clear_ai_cache(symbol=sym, clear_last=True)
             # ── AI 表现追踪：仅对AI真正开口(conf>0.5)的已平仓交易更新胜率 ──
             _ai_conf_open = pos.ai_conf_at_open if hasattr(pos, "ai_conf_at_open") else 0.0
             if _ai_conf_open > 0.5:
@@ -1562,12 +1679,17 @@ class PositionExec:
             with lock:
                 if pos.side == side_snapshot:
                     self.trader.state._reset_pos()
+            # 平仓完成，清除竞态标志
+            self._close_in_flight = False
             # 平仓后清除已提交的 SL/TP 记录，避免影响下一笔交易
             self._last_submitted_sl = 0.0
             self._last_submitted_tp = 0.0
             # 记录平仓退出时间与方向，供开仓冷却期使用
             gs_set("last_exit_ts", datetime.now(UTC).isoformat())
             gs_set("last_exit_side", side_snapshot)
+            gs_set("last_exit_reason", reason)
+            gs_set("last_entry_price", entry_snapshot)
+            gs_set("last_holding_minutes", _hold_minutes)
             # Phase 3: 状态机推进 → IDLE
             if hasattr(self.trader, '_state_machine') and self.trader._state_machine.is_exiting():
                 self.trader._state_machine.transition(TradingState.IDLE, "平仓确认完成")
@@ -1691,16 +1813,18 @@ class PositionExec:
                 except Exception as e:
                     log.error(f"验证仓位状态失败: {e}，下轮全量同步")
 
+        # 所有错误路径结束，清除竞态标志
+        self._close_in_flight = False
+
     def _handle_reverse_logic(self, sym: str, action: str, decision: Dict,
                                ind_15m: Dict, funding: Dict) -> bool:
         """
         处理 AI 输出的反向开仓指令（持有多单时输出 open_short，或反之）。
         返回 True 表示已处理并拦截后续流程，返回 False 表示未处理（应走默认逻辑）。
 
-        三层保护：
+        两层保护：
           1. 硬性 conf 门控：conf < 0.80 → 降级为仅平仓，不反手
-          2. 翻转防抖：600s 内不重复翻转（防连续打脸）
-          3. conf ≥ 0.80 + 冷却通过 → 执行翻转（consecutive_losses 不清零，新仓仍受冷却约束）
+          2. conf ≥ 0.80 → 执行翻转（consecutive_losses 不清零，新仓仍受冷却约束）
         """
         conf = decision.get("confidence", 0)
         decision_id = decision.get("decision_id") or 0
@@ -1718,17 +1842,24 @@ class PositionExec:
             )
             return True
 
-        # ── 第二层：翻转防抖冷却 ───────────────────────────────────────────
-        if self.trader._is_redundant_fast_signal(sym, "REVERSE_LOCK", action, conf, cooldown=600):
-            log.info(
-                f"⏳ [{sym}] 翻转动作处于 600s 冷却期内，防止连续打脸，忽略此动作"
-            )
-            return True
-
-        # ── 第三层：执行翻转 ───────────────────────────────────────────────
+        # ── 第二层：执行翻转 ───────────────────────────────────────────────
         log.warning(
             f"🔄 [{sym}] 满足高置信度({conf:.2f})翻转条件，正在执行【多空翻转】"
         )
+
+        # ── 翻转频率监控（10 分钟滑动窗口，仅告警不拦截）──
+        _now_ts = time.time()
+        _flip_ts = getattr(self.trader, '_flip_timestamps', [])
+        # 清理 10 分钟前的过期条目
+        _cutoff = _now_ts - 600
+        self.trader._flip_timestamps = [t for t in _flip_ts if t > _cutoff]
+        _flip_count = len(self.trader._flip_timestamps) + 1  # +1 = 本次
+        self.trader._flip_timestamps.append(_now_ts)
+        if _flip_count >= 2:
+            log.critical(
+                f"⚠️⚠️ [{sym}] 高频翻转告警：10 分钟内第 {_flip_count} 次翻转！"
+                f"请检查是否陷入震荡打脸，建议暂停 bot 观察"
+            )
 
         # 注意：consecutive_losses 保持不变，翻转后新仓仍受"止损后冷却"约束
         # 但 conf ≥ 0.80 时冷却期闯关条件（条件A）仍可放行
@@ -1764,12 +1895,32 @@ class PositionExec:
         if price <= 0:
             price = self.okx.get_current_price()
 
-        # 步骤4：构建反向开仓决策（复用 AI 原始决策结构，仅改 action）
+        # ── 步骤4（新增）：日风险上限检查，防止翻转累积突破风控线 ───────────
+        _today_risk = float(gs_get("today_opened_risk", 0.0))
+        _equity = self.trader.latest_equity
+        if _equity <= 0:
+            _equity = balance  # 权益未更新时回退为可用余额
+        _daily_cap = _equity * CFG.max_daily_risk_pct
+        if _today_risk >= _daily_cap:
+            log.warning(
+                f"🛑 [{sym}] 翻转开仓被日风险上限拦截: "
+                f"已用 {_today_risk:.2f}U >= 上限 {_daily_cap:.2f}U "
+                f"({CFG.max_daily_risk_pct*100:.1f}% × 权益 {_equity:.2f}U)"
+            )
+            log_event("reverse_blocked_by_daily_risk", {
+                "symbol": sym,
+                "today_risk": _today_risk,
+                "daily_cap": _daily_cap,
+                "equity": _equity,
+            })
+            return True   # 平仓已完成，仅阻止反向开仓
+
+        # 步骤5：构建反向开仓决策（复用 AI 原始决策结构，仅改 action）
         reverse_dec = dict(decision)
         reverse_dec["action"] = action
         reverse_dec["decision_id"] = decision_id
 
-        # 步骤5：执行反向开仓（使用 _do_open 完整参数链）
+        # 步骤6：执行反向开仓（使用 _do_open 完整参数链）
         try:
             self._do_open(
                 reverse_dec, price, balance, ind_15m["atr"], funding, decision_id,
