@@ -11,10 +11,12 @@ import json
 import math
 import threading
 import logging
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from typing import Optional, Dict, List, Any, TYPE_CHECKING
+from typing import Optional, Dict, List, Any, TYPE_CHECKING, Literal
 from datetime import datetime, timezone, timedelta
 from openai import OpenAI
+from pydantic import BaseModel, Field, ValidationError
 
 if TYPE_CHECKING:
     from market import SignalsModule
@@ -24,12 +26,42 @@ from common import (
     CFG, log, _webhook, _parse_dt, UTC,
     gs_get, gs_set, gs_increment, _call_reasoner,
     SYSTEM_PROMPT_TRADE,
+    ai_cache_query_counter, ai_cache_hit_counter, ai_cache_miss_counter,
+    _clean_json_text,
 )
 # ── 数据模型（core.py）──────────────────────────────────────────────────
-from core import GLOBAL_STATE
 # ── market_data 模块 ───────────────────────────────────────────────────
-from market import build_kline_series, calc_key_levels
+from market import build_kline_series, build_multi_tf_alignment, calc_key_levels, calc_composite_regime_score, classify_regime
 from position_exec import _get_atr_quantile
+
+
+# ── AI 响应 Pydantic 模型（Structured Output 客户端校验层）───────────────
+class TradeDecisionModel(BaseModel):
+    """
+    AI 决策响应结构模型（仅用于客户端校验，不做强制构造）。
+    使用 Optional + None 而非默认值，避免静默填充掩盖缺失字段。
+    extra="forbid" 拒绝未知字段，防止 AI 混入乱字段。
+    """
+    action: Literal["open_long", "open_short", "close_long", "close_short", "hold", "adjust_sl_tp", "skip"]
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    suggested_sl: Optional[float] = None
+    suggested_tp: Optional[float] = None
+    suggested_leverage: Optional[int] = Field(None, ge=1, le=10)
+    reason: str = Field(..., min_length=1)
+    wait_seconds: Optional[int] = Field(None, ge=0, le=300)
+    thought_process: Optional[str] = ""
+
+    class Config:
+        extra = "forbid"
+
+
+def _validate_with_pydantic(raw_dict: Dict) -> Optional[TradeDecisionModel]:
+    """尝试用 Pydantic 校验 AI 输出，失败返回 None（触发回退解析器）"""
+    try:
+        return TradeDecisionModel(**raw_dict)
+    except ValidationError as e:
+        log.debug(f"[Pydantic] 校验失败: {e}")
+        return None
 
 
 # ── 辅助函数（从主模块迁移）─────────────────────────────────────────────
@@ -42,72 +74,34 @@ def _price_of_level(item) -> float:
 
 def _call_reasoner_for_json(ai_client, messages: list, max_tokens: int = 2000,
                            timeout: int = 120) -> Dict:
-    """调用 reasoner 并解析 JSON 响应"""
+    """调用 reasoner 并解析 JSON 响应（含 Pydantic 校验层）"""
     raw = _call_reasoner(ai_client, messages, max_tokens=max_tokens, timeout=timeout)
-    return _parse_llm_json(raw)
+    result = _parse_llm_json(raw)
 
-
-def get_market_mode(ind_15m: Dict, current_price: float, prev_mode: str = "趋势") -> str:
-    """
-    计算当前市场模式（震荡激进/震荡/趋势），带滞后阈值防止频繁切换。
-    三种模式：
-      震荡激进：ADX极低(< osc_aggressive_adx_thresh) 且布林带较窄(< osc_aggressive_bb_thresh)
-               适合快进快出的均值回归，止损更紧，冷却更短
-      震荡：    布林带较窄(< osc_bb_width_thresh)，适合支撑/阻力位反转
-      趋势：    布林带较宽，适合追势
-    滞后逻辑：±10%死区防抖，以及震荡激进ADX±3死区，避免模式频繁切换。
-    """
-    bb_upper = ind_15m.get("bb_upper", 0)
-    bb_lower = ind_15m.get("bb_lower", 0)
-    p = current_price or 1
-    bb_width_raw = (bb_upper - bb_lower) / p if bb_upper > 0 else 0.05
-    # BB物理宽度地板（市值越高，绝对波动越大）
-    _physical_floor = 0.015
-    bb_width = max(bb_width_raw, _physical_floor)
-    adx      = ind_15m.get("adx", 30)
-    thresh   = CFG.osc_bb_width_thresh
-    agg_bb   = CFG.osc_aggressive_bb_thresh
-    agg_adx  = CFG.osc_aggressive_adx_thresh
-
-    # 波动率自适应死区：根据 ATR 比率调整滞后阈值
-    _atr_ratio = ind_15m.get('atr_ratio', 1.0)
-    if _atr_ratio > 1.5:
-        _hysteresis_mult = 1.15
-        _adx_buffer = 4
-    elif _atr_ratio < 0.8:
-        _hysteresis_mult = 1.05
-        _adx_buffer = 2
+    validated = _validate_with_pydantic(result)
+    if validated is None:
+        log.debug(f"[Reasoner Pydantic] 校验失败，使用回退值。原始: {result}")
+        result["confidence"] = max(0.0, min(1.0, float(result.get("confidence", 0.5))))
     else:
-        _hysteresis_mult = 1.10
-        _adx_buffer = 3
+        result = validated.dict()
+    return result
 
-    if prev_mode == "震荡激进":
-        if bb_width < agg_bb * _hysteresis_mult and adx < agg_adx + _adx_buffer:
-            return "震荡激进"
-        elif bb_width < thresh * 1.1:
-            return "震荡"
-        else:
-            return "趋势"
-    elif prev_mode == "震荡":
-        if bb_width < thresh * 1.1:
-            if bb_width < agg_bb and adx < agg_adx:
-                return "震荡激进"
-            return "震荡"
-        else:
-            return "趋势"
-    elif prev_mode == "趋势":
-        if bb_width > thresh * (2 - _hysteresis_mult):
-            return "趋势"
-        if bb_width < agg_bb * (2 - _hysteresis_mult) and adx < agg_adx * (2 - _hysteresis_mult/1.1):
-            return "震荡激进"
-        return "震荡"
-    else:
-        if bb_width < agg_bb and adx < agg_adx:
-            return "震荡激进"
-        elif bb_width < thresh:
-            return "震荡"
-        else:
-            return "趋势"
+
+def get_market_mode(ind_15m: Dict, current_price: float,
+                    prev_market_mode: str | None = None,
+                    funding: Dict = None,
+                    returns_30: np.ndarray | None = None) -> tuple[str, float]:
+    """
+    计算市场模式及复合评分。
+    返回 (categorical_mode: str, regime_score: float)。
+    - mode: 震荡激进 / 震荡 / 趋势（带滞后阈值防频繁切换）
+    - score: 0~1，连续复合评分
+    """
+    if prev_market_mode is None:
+        prev_market_mode = "趋势"
+    score = calc_composite_regime_score(ind_15m, funding, returns_30)
+    mode = classify_regime(score, prev_market_mode)
+    return mode, score
 
 
 def _calc_period_score(ind_15m: Dict, ind_1h: Dict, ind_4h: Dict) -> tuple:
@@ -138,11 +132,78 @@ def build_funding_trend(funding_history: List[Dict]) -> str:
     direction = "正" if avg > 0 else "负"
     return f"近3h平均费率: {avg*100:+.4f}% ({direction}费率环境)"
 
-# ── JSON 解析辅助 ─────────────────────────────────────────────────────────
-def _clean_json_text(raw_text: str) -> str:
-    """剥离 Markdown 围栏，返回纯文本"""
-    return re.sub(r'```(?:json)?\s*', '', raw_text).replace('```', '').strip()
 
+# ── System Prompt 缓存（方向4优化：静态内容只建一次）───────────────────────
+import hashlib
+_system_prompt_cache: Dict[str, str] = {}  # content_hash → system_prompt_str
+
+def get_system_prompt(macro_context: str = "",
+                      key_levels: Optional[Dict] = None,
+                      funding_history: Optional[List[Dict]] = None) -> str:
+    """
+    构建增强版 System Prompt（静态/准静态信息），带 hash 缓存。
+    macro_context / key_levels / funding_history 变化时才重建，
+    预计每天重建 2-4 次，每次 ~1000 tokens（一次性成本）。
+    """
+    # 生成内容指纹，仅内容真正变化时才重建
+    parts = [macro_context or ""]
+    if key_levels and key_levels.get("_valid"):
+        parts.append(json.dumps(key_levels, sort_keys=True))
+    if funding_history:
+        parts.append(json.dumps(funding_history[-6:], sort_keys=True))
+    content_hash = hashlib.md5("|".join(parts).encode()).hexdigest()
+
+    if content_hash in _system_prompt_cache:
+        return _system_prompt_cache[content_hash]
+
+    funding_trend = build_funding_trend(funding_history or [])
+
+    # ── 关键价位格式说明（静态知识，移入 system prompt 避免每次重复）──
+    key_levels_hint = ""
+    if key_levels and key_levels.get("_valid"):
+        key_levels_hint = (
+            "关键价位参考格式：\n"
+            "  阻:价格(距现价距离%)[触及次数]\n"
+            "  撑:价格(距现价距离%)[触及次数]\n"
+            "  Piv:枢纽价格\n"
+            "  注意：支撑/阻力位仅作锚定参考，不得作为开仓唯一依据。\n"
+        )
+
+    system_prompt = (
+        f"你是专业的ETH-USDT-SWAP 10x杠杆量化交易决策引擎。只输出JSON，不输出任何其他内容。\n\n"
+        f"{macro_context}\n\n"
+        f"{key_levels_hint}"
+        f"{funding_trend}\n\n"
+        f"【决策原则】（以下规则优先级高于用户输入的参考数据）\n"
+        f"0.矛盾速查：imbal_near<0不可open_long；卖墙距<0.3%不可追多；VSpike方向与开仓方向矛盾→谨慎评估而非直接hold。\n"
+        f"0.5【极端量能特权】当VSpike≥10x且buy_pct≥75%（或buy_pct≤25%做空）时，忽略imbal_near和卖墙/买墙距离检查，强制跟随量能方向。\n"
+        f"1.微观优先：VSpike/盘口/OB结构是第一信号，宏观指标（新闻/资金面）仅作确认。\n"
+        f"2.【信号纯度信任规则】（最高优先级）\n"
+        f"  用户输入中包含 [信号纯度 SignalPurity] 评分（0~1），这是客观的多维信号一致性度量。\n"
+        f"  SignalPurity≥0.70 → 多维度已确认一致性，不要因为单一指标轻微分歧就说hold，应给出方向性决策。\n"
+        f"  SignalPurity 0.55~0.69 → 中等质量，规则层已过滤最差信号，可适当开仓但降低置信度。\n"
+        f"  SignalPurity<0.55 → 已被规则层拦截，若你仍收到此请求说明是VSpike≥8x豁免场景，需谨慎评估。\n"
+        f"3.极端量能(>10x)时优先结合CVD/流量方向表态，不要因为RSI超买/超卖就hold。\n"
+        f"4.规则引擎信号值得重视。若规则引擎已给出方向性参考，除非有明确反向证据，否则应倾向跟随而非hold。\n"
+        f"5.止损必给：open必须同时给suggested_sl和suggested_tp。\n"
+        f"6.关键位锚定：止损优先锚定最近支撑/阻力，再考虑ATR。\n"
+        f"7.数据自洽：说超买需RSI>=70(震荡>=65)，背离需div=bullish/bearish。\n"
+        f"8.趋势市顺势追击，震荡市均值回归。\n"
+        f"9.新闻/资金面可作为辅助确认，但需与微观数据自洽。\n"
+        # === 新增持仓平仓原则（核心）===
+        f"10.持仓果断原则：已有明显浮盈(>1.5%)但微观信号转坏(VSpike反向、RSI≥68、买方支撑墙减弱、CVD净卖出)时，"
+        f"**优先选择close锁定利润**，宁可早平也不让利润回吐。\n"
+        f"11.持仓翻转原则：VSpike≥5.0x 且方向与当前持仓完全相反 → 立即评估close或反手，不得恋战。\n"
+        f"12.亏损快刀原则：浮亏>0.5% 且微观数据不支持当前方向 → 果断close，不赌反弹。\n\n"
+        f"【输出格式】只输出JSON:\n"
+        f'{{"action":"","confidence":0.0~1.0,"suggested_sl":数值,"suggested_tp":数值,'
+        f'"suggested_leverage":1~10,"reason":"一句话","wait_seconds":0~300}}'
+    )
+
+    _system_prompt_cache[content_hash] = system_prompt
+    return system_prompt
+
+# ── JSON 解析辅助 ─────────────────────────────────────────────────────────
 def _parse_llm_json(raw_text: str) -> Dict:
     """从 LLM 原始输出中稳健提取 JSON 决策字典（栈匹配）"""
     cleaned = _clean_json_text(raw_text)
@@ -201,10 +262,16 @@ class AIGatekeeper:
         # 持久化最近一次有效AI决策，防止异步调用间隙返回 None 导致 "AI 未就绪"
         self._last_decision:  Optional[Dict] = None
         self._last_decision_ts: float = 0.0
+        # 最后一次 cache clear 的时间戳（monotonic），供 worker 检测竞态
+        self._cache_cleared_ts: float = 0.0
         # Drift snapshot
         self._last_price:     float = 0.0
         self._last_rsi_bkt:   Optional[str] = None
         self._last_bb_zone:   Optional[str] = None
+        self._last_atr_ratio: Optional[float] = None
+        # VSpike 缓存快照：用于检测量能方向翻转
+        self._last_vspike_mult: float = 0.0
+        self._last_vspike_dir:  str   = ""  # "买方主导"/"卖方主导"/""
         # Silence
         self._last_request_ts:    float = 0.0
         self._last_decision_price: float = 0.0
@@ -224,26 +291,55 @@ class AIGatekeeper:
         self._entry_fasttrack_mult:  float = 0.0
         self._entry_fasttrack_until: float = 0.0
 
-    def get_cached(self, market_mode: str = "") -> Optional[Dict]:
-        """返回有效缓存；过期则清除并返回最近一次有效决策（而非 None）"""
+    def get_cached(self, market_mode: str = "", atr_ratio: Optional[float] = None,
+                   vspike_mult: float = 0.0, vspike_dir: str = "") -> Optional[Dict]:
+        """返回有效缓存；过期则清除并返回最近一次有效决策（而非 None）
+        atr_ratio: 当前ATR比率，用于动态调整TTL。如为None，则使用上次缓存时的ATR比率
+        vspike_mult/vspike_dir: 当前 VSpike 状态，用于检测量能方向翻转"""
+        ai_cache_query_counter.inc()
         with self._cache_lock:
             if self._cache is not None:
-                ttl = self._get_ttl(market_mode)
-                age = time.monotonic() - self._cache_ts
-                if age > ttl:
-                    log.info(f"AI缓存已过期（{age:.0f}s>{ttl}s），强制刷新")
+                # ── VSpike 方向翻转检测：量能方向完全相反且倍数 ≥6x → 清除缓存 ──
+                if (vspike_mult >= 6.0
+                        and self._last_vspike_mult >= 6.0
+                        and self._last_vspike_dir
+                        and vspike_dir
+                        and self._last_vspike_dir != vspike_dir):
+                    log.info(
+                        f"🔥 VSpike方向翻转（缓存时={self._last_vspike_dir}{self._last_vspike_mult:.1f}x → "
+                        f"当前={vspike_dir}{vspike_mult:.1f}x），强制清除缓存"
+                    )
                     self._cache = None
                     self._cache_hash = ""
+                    ai_cache_miss_counter.inc()
+                    # 返回最近有效决策
+                    if self._last_decision is not None:
+                        return dict(self._last_decision)
+                    return None
+
+                # 使用传入的atr_ratio或上次缓存时的atr_ratio
+                effective_atr = atr_ratio if atr_ratio is not None else self._last_atr_ratio
+                ttl = self._get_ttl(market_mode, effective_atr)
+                age = time.monotonic() - self._cache_ts
+                if age > ttl:
+                    log.info(f"AI缓存已过期（{age:.0f}s>{ttl}s，ATR比率={effective_atr:.2f}），强制刷新")
+                    self._cache = None
+                    self._cache_hash = ""
+                    ai_cache_miss_counter.inc()
                 else:
+                    ai_cache_hit_counter.inc()
                     return self._cache
             # 缓存为空或已过期时，返回最近一次有效决策，避免异步调用间隙出现 "AI 未就绪"
             if self._last_decision is not None:
-                return dict(self._last_decision)  # 返回副本防止外部修改
+                ai_cache_miss_counter.inc()
+                return dict(self._last_decision)
+            ai_cache_miss_counter.inc()
             return None
 
     def set_cache(self, decision: Dict, input_sig: str,
                   price: float, rsi: float, macd: float,
-                  rsi_bkt: str, bb_zone: str):
+                  rsi_bkt: str, bb_zone: str, atr_ratio: float = 1.0,
+                  vspike_mult: float = 0.0, vspike_dir: str = ""):
         with self._cache_lock:
             self._cache           = decision
             self._cache_ts        = time.monotonic()
@@ -255,16 +351,28 @@ class AIGatekeeper:
             self._last_decision_macd  = macd
             self._last_rsi_bkt    = rsi_bkt
             self._last_bb_zone   = bb_zone
+            self._last_atr_ratio = atr_ratio
+            # 记录 VSpike 快照
+            self._last_vspike_mult = vspike_mult
+            self._last_vspike_dir  = vspike_dir
             # 持久化最近一次有效AI决策
             self._last_decision  = dict(decision)
 
-    def clear(self):
+    def clear(self, clear_last: bool = False):
         with self._cache_lock:
             self._cache       = None
             self._cache_ts    = 0.0
             self._cache_hash  = ""
             self._last_rsi_bkt  = None
             self._last_bb_zone  = None
+            self._last_vspike_mult = 0.0
+            self._last_vspike_dir  = ""
+            # VSpike 紧急事件：同时清除 _last_decision，防止 fallback 返回旧决策
+            if clear_last:
+                self._last_decision = None
+                self._last_decision_ts = 0.0
+            # 记录 clear 时间戳，供 worker 竞态检测
+            self._cache_cleared_ts = time.monotonic()
 
     @property
     def cache_hash(self) -> str:
@@ -344,12 +452,33 @@ class AIGatekeeper:
         return self._next_retry_delay
 
     @staticmethod
-    def _get_ttl(market_mode: str) -> int:
+    def _get_ttl(market_mode: str, atr_ratio: Optional[float] = None) -> int:
+        """动态TTL调整：基于市场模式和ATR波动率自适应
+        高波动（ATR比率>1.5）时缩短TTL，低波动（ATR比率<0.7）时延长TTL"""
+        # 基础TTL
         if market_mode == "趋势":
-            return CFG.cache_ttl_trend
+            base_ttl = CFG.cache_ttl_trend
         elif market_mode == "震荡激进":
-            return int(CFG.cache_ttl_osc * 0.67)
-        return CFG.cache_ttl_osc
+            base_ttl = int(CFG.cache_ttl_osc * 0.67)
+        else:
+            base_ttl = CFG.cache_ttl_osc
+
+        # ATR动态调整
+        if atr_ratio is not None:
+            if atr_ratio > 1.5:  # 高波动
+                adjusted_ttl = int(base_ttl * 0.5)  # 缩短50%
+                log.debug(f"TTL动态调整: 高波动(atr_ratio={atr_ratio:.2f})，{base_ttl}s→{adjusted_ttl}s")
+                return max(60, adjusted_ttl)  # 最低60秒
+            elif atr_ratio < 0.7:  # 低波动
+                adjusted_ttl = int(base_ttl * 1.5)  # 延长50%
+                log.debug(f"TTL动态调整: 低波动(atr_ratio={atr_ratio:.2f})，{base_ttl}s→{adjusted_ttl}s")
+                return adjusted_ttl
+            else:  # 正常波动
+                log.debug(f"TTL动态调整: 正常波动(atr_ratio={atr_ratio:.2f})，使用基础TTL {base_ttl}s")
+                return base_ttl
+        else:
+            # 无ATR数据，使用基础TTL
+            return base_ttl
 
 
 # ============================================================
@@ -417,6 +546,13 @@ class ArbitrationTrigger:
                    depth_dir: str,
                    price: float,
                    reason: str,
+                   # ── 新增：多周期共振 + 平仓原因 + 微观深度 ──
+                   rsi_1h: float = 50.0,
+                   rsi_4h: float = 50.0,
+                   exit_reason: str = "",
+                   imbal_near: float = 0.0,
+                   bid_wall: str = "",
+                   ask_wall: str = "",
     ) -> Optional[Dict]:
         if not self._qwen_available:
             return None
@@ -428,14 +564,37 @@ class ArbitrationTrigger:
             "均衡": "多空均衡（谨慎）",
         }.get(depth_dir, "未知")
 
+        # 多周期 RSI 共振
+        _rsi_tf = f"RSI: 15m={rsi:.1f} | 1h={rsi_1h:.1f} | 4h={rsi_4h:.1f}"
+        if rsi > 70 and rsi_1h > 70:
+            _rsi_tf += " ⚠️超买共振"
+        elif rsi < 30 and rsi_1h < 30:
+            _rsi_tf += " ⚠️超卖共振"
+
+        # 微观深度补充
+        _micro_extra = ""
+        if abs(imbal_near) > 0.20:
+            _micro_extra += f"近场失衡:{imbal_near:+.3f} {'买方压制' if imbal_near > 0 else '卖方压制'} "
+        if bid_wall:
+            _micro_extra += f"买方墙:{bid_wall} "
+        if ask_wall:
+            _micro_extra += f"卖方墙:{ask_wall}"
+
+        # 平仓原因
+        _exit_ctx = ""
+        if exit_reason:
+            _exit_ctx = f"- 上次平仓原因：{exit_reason}\n"
+
         prompt = f"""你是 ETH 永续合约的交易顾问，只回答方向和置信度。
 当前简明局势：
 - 订单流方向：{direction_tag}
 - VSpike 倍数：{vspike_mult:.1f}x（成交量突增）
 - 订单簿失衡度：{ob_imbalance:.2f}（>0买强，<0卖强）
-- RSI（14）：{rsi:.1f}
+- {_rsi_tf}
 - 市场模式：{market_mode}
 - 当前价格：${price:.2f}
+{_exit_ctx}- L1建议{reason}
+{f'- 微观补充：{_micro_extra}' if _micro_extra else ''}
 你的任务：
 仅根据以上信息，判断是否{side_tag}。
 输出格式（严格JSON）：
@@ -453,7 +612,7 @@ class ArbitrationTrigger:
             import json as _json
             try:
                 data = _json.loads(content)
-            except json.JSONDecodeError as e:
+            except _json.JSONDecodeError as e:
                 log.error(f"[ArbitrationTrigger] Qwen JSON 解析失败：{e} | 原始输出：{content[:200]}")
                 data = {"action": "hold", "confidence": 0.0, "reason": "JSON 解析失败"}
             log.info(f"[ArbitrationTrigger] 千问投票: {data.get('action')} conf={data.get('confidence', 0):.2f}")
@@ -612,9 +771,9 @@ class ConvictionScorer:
         _atr_ratio   = ctx.get("atr_ratio", 1.0)
         _trend_score = ctx.get("trend_alignment_score", 0.5)  # 默认中性
 
-        # 环境乘数：trend_score(0.8~1.0) × ATR修正（收窄范围，避免与 mode_coeff 重复惩罚）
-        env_mult = (0.80 + 0.20 * _trend_score) * (
-            1.12 if _atr_ratio > 1.5 else 0.90 if _atr_ratio < 0.7 else 1.00
+        # 环境乘数：仅 ATR 修正，trend_score 已由 mode_coeff 惩罚，不再重复
+        env_mult = (
+            1.12 if _atr_ratio > 1.5 else 0.92 if _atr_ratio < 0.7 else 1.00
         )
 
         # 风险乘数
@@ -643,61 +802,57 @@ class ConvictionScorer:
               at_key_level: bool  = False,
               market_mode:  str   = "趋势",
               context:       Dict  = None,
-              # ── 新闻/恐贪维度（建议3）──
-              news_sentiment: float = 0.0,
-              fear_greed:     int   = 50,
     ) -> Dict:
         ctx = context or {}
 
-        # ── 极端量能逃生通道：VSpike ≥ 15x 且方向明确时，保底分 55 ──
-        _extreme_vspike = vspike_mult >= 15.0
-        if _extreme_vspike:
-            _buy_pct = ctx.get("buy_pct", 0.5)
-            # 方向明确判定：买方主导(buy_pct≥80%) 或 卖方主导(buy_pct≤20%)
-            # buy_pct 来自实际成交占比（真金白银），比挂单簿更可靠
-            _direction_clear = (_buy_pct >= 0.80 or _buy_pct <= 0.20)
-            _flow_dir = ctx.get("flow_direction", "")
-            _vs_direction_ok = (
-                (action == "open_long" and _buy_pct >= 0.80) or
-                (action == "open_short" and _buy_pct <= 0.20)
-            )
-            # 方向确认：成交占比极端 + 方向与开仓动作一致
-            direction_confirmed = _direction_clear and _vs_direction_ok
-            if direction_confirmed:
-                return {
-                    "score":       55.0,
-                    "kelly_ratio": 0.55,
-                    "env_mult":    1.0,
-                    "risk_mult":   1.0,
-                    "components": {
-                        "ai_raw":      0,
-                        "spike":       vspike_mult,
-                        "ob":          ob_imbalance,
-                        "level":       8.0 if at_key_level else 0.0,
-                        "rsi_penalty": 0.0,
-                    },
-                    "extreme_bypass": True,
-                }
-
-        # ── 硬门槛：AI 置信度不足直接打回 ──
-        if ai_conf < 0.55:
-            return {
-                "score":       0.0,
-                "kelly_ratio": 0.0,
-                "env_mult":    1.0,
-                "risk_mult":   1.0,
-                "components": {"ai_raw": 0, "spike": 0, "ob": 0, "level": 0, "rsi_penalty": 0},
-            }
+        # ── 硬门槛：AI 置信度不足 → 大幅压缩 AI 权重，但其他维度仍参与评分 ──
+        # 修复：原代码直接 return 0.0，导致 VSpike/盘口/关键价位全部归零
+        _ai_floor_penalty = ai_conf < 0.55
+        if _ai_floor_penalty:
+            # AI 不确信时，AI 部分按 0.40 系数计算（而非直接归零）
+            ai_conf = ai_conf * 0.40 / 0.55  # 线性映射 0~0.55 → 0~0.40
         is_long = action == "open_long"
         _ai_w_mult = float(gs_get("ai_weight_mult", 1.0))
         ai_score = ai_conf * 85.0 * _ai_w_mult  # 从 65→85，AI 权重提升到 ~0.70
         tau = 4.5  # 从 8.0→4.5，让 2x~6x 区间分数梯度更明显
-        spike_score = 18.0 * math.tanh(vspike_mult / tau) if vspike_mult > 0 else 0.0  # 从 25→18，降低 VSpike 占比
-        # VSpike ≥6.0x 提供逃生窗口：额外 +15 bonus，不受 tanh 饱和限制
+
+        # ── VSpike 极端量能保底通道：≥10x 且方向一致时，保底分 45 ──
+        # 修复：从 15x 降至 10x，方向门槛从 80% 降至 70%，放在 AI 地板之后
+        _extreme_vspike = vspike_mult >= 10.0 and (
+            (is_long and ctx.get("buy_pct", 0.5) >= 0.70) or
+            (not is_long and ctx.get("buy_pct", 0.5) <= 0.30)
+        )
+        if _extreme_vspike:
+            return {
+                "score":       45.0,
+                "kelly_ratio": 0.45,
+                "env_mult":    1.0,
+                "risk_mult":   1.0,
+                "components": {
+                    "ai_raw":      round(ai_score, 2),
+                    "spike":       vspike_mult,
+                    "ob":          0.0,
+                    "level":       0.0,
+                    "rsi_penalty": 0.0,
+                },
+                "extreme_bypass": True,
+            }
+
+        # === VSpike 方向一致性检查（修复反向极端量能漏洞）===
         if vspike_mult >= 6.0:
-            spike_score += 15.0
-        # P0-3: spike_score 上限 cap=30，防止极端 VSpike (100x+) 独占 ConvictionScore
-        spike_score = min(spike_score, 30.0)
+            buy_pct = ctx.get("buy_pct", 0.5)
+            # 强反向极端量能：直接倒扣
+            if (is_long and buy_pct <= 0.25) or (not is_long and buy_pct >= 0.75):
+                spike_score = -12.0
+                log.warning(f"🛡️ [VSpike反向惩罚] 极端量能 {vspike_mult:.1f}x "
+                            f"({'买方' if buy_pct >= 0.75 else '卖方'}主导) "
+                            f"与 {'开多' if is_long else '开空'} 方向冲突，spike_score=-12")
+            else:
+                spike_score = 18.0 * math.tanh(vspike_mult / tau) + 15.0
+                spike_score = min(spike_score, 30.0)
+        else:
+            spike_score = 18.0 * math.tanh(vspike_mult / tau) if vspike_mult > 0 else 0.0
+        spike_score = max(spike_score, -15.0)  # 防止极端负分拖垮总分
         if is_long:
             ob_score = ob_imbalance * 15.0  # 从 10→15，提升订单簿权重
         else:
@@ -707,21 +862,7 @@ class ConvictionScorer:
         rsi_dist = abs(rsi - rsi_ideal) / 40.0
         rsi_penalty = min(6.0, rsi_dist * 6.0)  # 上限从 12→6，RSI 不应比盘口更重要
 
-        # ── 新闻/恐贪维度（建议3）── 最多 ±5 分 ──
-        _news_score = 0.0
-        if abs(news_sentiment) > 0.3:
-            _news_score = 4.0 if news_sentiment > 0 else -4.0
-        if fear_greed < 15:
-            _news_score += 3.0  # 极度恐慌→物极必反，做多加分
-        elif fear_greed > 85:
-            _news_score -= 3.0  # 极度贪婪→物极必反，做空加分
-        # 方向对齐检查：新闻偏多但做空则扣分，反之亦然
-        if action == "open_long" and news_sentiment < -0.4:
-            _news_score -= 2.0
-        elif action == "open_short" and news_sentiment > 0.4:
-            _news_score -= 2.0
-
-        raw = ai_score + spike_score + ob_score + level_score - rsi_penalty + _news_score
+        raw = ai_score + spike_score + ob_score + level_score - rsi_penalty
         mode_coeff = {"趋势": 1.0, "震荡": 0.9, "震荡激进": 0.85}.get(market_mode, 1.0)
         score_val = max(0.0, min(100.0, raw * mode_coeff))
         sigmoid_k = 2.5 * (score_val - 50) / 50
@@ -739,9 +880,63 @@ class ConvictionScorer:
                 "ob":          ob_score,
                 "level":       level_score,
                 "rsi_penalty": rsi_penalty,
-                "news_fg":     round(_news_score, 1),
             }
         }
+
+
+# ============================================================
+# 辅助函数：构造 Funding Rate 行 + 关键价位距离行
+# ============================================================
+
+def _build_funding_rate_line(funding: Dict, funding_history: Optional[List[Dict]] = None) -> str:
+    """构造资金费率行：当前费率 + 8h变化（覆盖8h，需funding_history≥32条）"""
+    _fr = funding.get("funding_rate", 0)
+    _fr_pct = _fr * 100
+    _fg = gs_get("fear_greed", 50)
+    _fg_val = _fg if isinstance(_fg, (int, float)) else 50
+
+    _change_8h = None
+    if funding_history and len(funding_history) >= 2:
+        _oldest = funding_history[0].get("funding_rate", 0)
+        _change_8h = (_fr - _oldest) * 100
+
+    if _change_8h is not None:
+        return f"恐贪={_fg_val} | 资金费={_fr_pct:+.3f}% (8h变化: {_change_8h:+.3f}%)"
+    return f"恐贪={_fg_val} | 资金费={_fr_pct:+.3f}%"
+
+
+def _build_key_level_distance(key_levels: Optional[Dict], price_now: float) -> str:
+    """构造关键价位距离行：离最近支撑/阻力距离"""
+    if not key_levels or not key_levels.get("_valid") or price_now <= 0:
+        return "关键位:暂无"
+
+    res = key_levels.get("resistances", [])[:3]
+    sup = key_levels.get("supports", [])[:3]
+
+    def _price_of(item):
+        if isinstance(item, dict):
+            return float(item.get("price", 0))
+        return float(item) if item else 0
+
+    parts = []
+    # 最近阻力（高于现价）
+    if res:
+        _above_r = [_price_of(r) for r in res if _price_of(r) > price_now]
+        if _above_r:
+            _near_r = min(_above_r)
+            _dist_r = (_near_r - price_now) / price_now * 100
+            parts.append(f"阻力+{_dist_r:.1f}%")
+    # 最近支撑（低于现价）
+    if sup:
+        _below_s = [_price_of(s) for s in sup if _price_of(s) < price_now]
+        if _below_s:
+            _near_s = max(_below_s)
+            _dist_s = (price_now - _near_s) / price_now * 100
+            parts.append(f"支撑-{_dist_s:.1f}%")
+
+    if parts:
+        return " | ".join(parts)
+    return "关键位:暂无"
 
 
 # ============================================================
@@ -853,7 +1048,10 @@ class SmartAIConsultant:
             }
     # ── 千问并行轻量调用（供主决策并行使用）────────────────────────────────────
     def _call_qwen_decision(self, simple_prompt: str, allowed_actions: list,
-                            market_mode: str, action_hint: str) -> Optional[Dict]:
+                            market_mode: str, action_hint: str,
+                            cvd_delta: float = 0.0,
+                            trend_score: float = 0.5,
+                            key_level_dist: float = 0.0) -> Optional[Dict]:
         """
         千问轻量并行调用：复用 deepseek 的 prompt（~600 tokens），
         用独立 prompt 做第二意见投票。超时 15s 返回 None。
@@ -861,13 +1059,29 @@ class SmartAIConsultant:
         if not self._qwen_available:
             return None
 
+        # 构建精简基础 prompt
+        _base = simple_prompt.split('[5条铁律]')[0] if '[5条铁律]' in simple_prompt \
+            else simple_prompt.split('[决策原则]')[0] if '[决策原则]' in simple_prompt \
+            else simple_prompt
+
+        # 补充微观深度数据（极端量能场景下帮助 Qwen 理解 CVD 净量含义）
+        deep_ctx = ""
+        if cvd_delta != 0:
+            _dir_txt = "净买入" if cvd_delta > 0 else "净卖出"
+            deep_ctx += f"CVD累计{_dir_txt}: {abs(cvd_delta):+.0f}张 | "
+        if trend_score > 0:
+            deep_ctx += f"趋势对齐分数: {trend_score:.2f} | "
+        if key_level_dist > 0:
+            deep_ctx += f"距最近关键位: {key_level_dist*100:.1f}%"
+
         prompt = f"""你是ETH量化交易顾问，请给出交易建议。
-{simple_prompt.split('[5条铁律]')[0] if '[5条铁律]' in simple_prompt else simple_prompt.split('[决策原则]')[0] if '[决策原则]' in simple_prompt else simple_prompt}
+{_base}
 [决策原则]
 1.你只给第二意见，不重复主模型判断。
 2.如果主模型建议{action_hint}但你认为数据不支持，可直接说hold。
 3.输出严格JSON。
-
+[补充微观深度数据]
+{deep_ctx}
 只输出JSON:
 {{"action":"","confidence":0.0~1.0,"reason":"一句话"}}"""
 
@@ -877,6 +1091,7 @@ class SmartAIConsultant:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=300,
+                timeout=CFG.qwen_timeout,
             )
             content = response.choices[0].message.content.strip()
             data = json.loads(content)
@@ -891,6 +1106,26 @@ class SmartAIConsultant:
         except Exception as e:
             log.debug(f"🔇 Qwen并行调用失败: {e}")
             return None
+
+    def _fast_ai_direction_check(self, simple_prompt: str, allowed_actions: list, system_prompt: str) -> Dict:
+        """
+        【规则引擎专用快速方向校验】
+        只调用 L1 DeepSeek-Chat，不走 L2 Qwen 和 L3 Reasoner
+        严格控制在 25 秒内，专门用于「快速判断规则引擎建议的方向是否合理」
+        """
+        try:
+            log.info("🔍 [Fast Direction Check] 只调用 L1 DeepSeek-Chat（快速方向校验 ≤25s）")
+            result = self._single_call(
+                temperature=0.25,
+                user_prompt=simple_prompt,
+                allowed_actions=allowed_actions,
+                model="deepseek-chat",
+                system_prompt=system_prompt
+            )
+            return result
+        except Exception as e:
+            log.warning(f"[Fast Direction Check] 异常: {e}")
+            return {"action": "hold", "confidence": 0.5, "reason": "快速方向校验异常"}
 
     # ── 子方法：构造 prompt ────────────────────────────────────────────────
 
@@ -909,7 +1144,10 @@ class SmartAIConsultant:
                               # ── 预计算值（由 get_decision 顶部算好再传入，避免重复计算）──
                               _osc_market: Optional[str] = None,
                               _period_score: Optional[float] = None,
-                              _score_desc: Optional[str] = None) -> tuple:
+                              _score_desc: Optional[str] = None,
+                              vs_status: Optional[Dict] = None,
+                              # ── System Prompt（由 get_decision 构造后传入，静态内容只建一次）──
+                              _system_prompt: Optional[str] = None) -> tuple:
         price_now = ind_15m.get("price", 0)
         has_pos   = bool(pos_info.get("side"))
         _bb_upper = ind_15m.get("bb_upper", 0)
@@ -936,7 +1174,7 @@ class SmartAIConsultant:
             levels_str = " | ".join(parts)
 
         # market mode（预计算传入，避免重复）
-        _market_mode = _osc_market if _osc_market else get_market_mode(ind_15m, _bb_price, prev_market_mode)
+        _market_mode = _osc_market if _osc_market else get_market_mode(ind_15m, _bb_price, prev_market_mode)[0]
         mode_hint = ("顺势追击" if _market_mode == "趋势"
                      else "均值回归" if _market_mode == "震荡"
                      else "快进快出")
@@ -974,8 +1212,39 @@ class SmartAIConsultant:
                               f"原价{_lspx:.2f}现{price_now:.2f}({_pct:.1f}%)。"
                               f"同向开仓需conf>=0.75。")
 
+        # ── AI 可读风险状态（仅连亏≥1+空仓时注入，让 AI 自己理解"不能急着开仓"）──
+        _risk_block = ""
+        _consec = gs_get("consecutive_losses", 0)
+        if _consec >= 1 and not has_pos:
+            _vs_r = vs_status or {}
+            _vs_mult_r = _vs_r.get("mult", 0.0)
+            _vs_dir_r = _vs_r.get("direction", "")
+            _stop_dir_r = gs_get("last_stop_direction", "")
+            _entry_px = gs_get("last_entry_price", 0.0)
+            _hold_min = gs_get("last_holding_minutes", 0)
+            _stop_pnl = gs_get("last_stop_pnl_pct", 0.0)
+            _stop_px = gs_get("last_stop_price", 0.0)
+            _exit_r = gs_get("last_exit_reason", "")[:50]
+            if _stop_dir_r:
+                _dir_name = "long" if _stop_dir_r == "long" else "short"
+                _side_cn = "多" if _stop_dir_r == "long" else "空"
+                _risk_block = (
+                    f"[上一笔交易] {_side_cn} 开@{_entry_px:.2f} → {_exit_r or '止损'} → "
+                    f"{_stop_pnl*100:.1f}%（持仓{_hold_min:.0f}分钟）\n"
+                    f"[当前风险状态] 连亏{_consec}笔"
+                    f"，当前VSpike={_vs_mult_r:.1f}x{_vs_dir_r}，"
+                    f"若建议开仓，请在reason中说明为何当前场景与上一笔不同\n\n"
+                )
+
         # kline
-        kline_str = build_kline_series(ind_15m, ind_1h, n_15m=8, n_1h=4)
+        kline_str = build_kline_series(ind_15m, ind_1h, ind_4h, n_15m=8, n_1h=6)
+
+        # 多周期指标对齐摘要
+        if ind_4h is not None:
+            _tf_align = build_multi_tf_alignment(ind_15m, ind_1h, ind_4h)
+            tf_align_block = f"\n{_tf_align}\n"
+        else:
+            tf_align_block = ""
 
         # ===== [微观] 区块：VSpike / 盘口微观结构 =====
         # 注：详细 CVD/吃单流量 数据已通过 fast_context 传入，此处仅提取 ind_15m/depth 可直接获取的微观信号
@@ -1030,25 +1299,22 @@ class SmartAIConsultant:
         _ms = market_sentiment or {}
         if _ms.get("_valid"):
             _ls = _ms.get("ls_ratio")
-            _oi_chg = _ms.get("oi_change_pct")
-            _tbr = _ms.get("taker_buy_ratio")
-            _oi_str = f"{_oi_chg:+.1f}%" if _oi_chg is not None else "暂无"
-            _oi_dir = "减仓" if _oi_chg is not None and _oi_chg < 0 else ("增仓" if _oi_chg is not None else "")
-            _taker_dir = ""
-            if _tbr is not None:
-                if _tbr > 1.05:
-                    _taker_dir = "买方主导"
-                elif _tbr < 0.95:
-                    _taker_dir = "卖方主导"
-                else:
-                    _taker_dir = "均衡"
+            # OI 双窗口（15min + 1h）
+            _oi_15m = _ms.get("oi_change_15m")
+            _oi_1h = _ms.get("oi_change_1h")
+            _oi_15m_str = f"{_oi_15m:+.1f}%" if _oi_15m is not None else "暂无"
+            _oi_1h_str = f"{_oi_1h:+.1f}%" if _oi_1h is not None else "暂无"
+            # Taker Buy Ratio 百分比（5min短期 + 15min中期）
+            _tbr_5m = _ms.get("taker_buy_5m")
+            _tbr_15m = _ms.get("taker_buy_15m")
+            _tbr_pct_5m = f"{_tbr_5m*100:.0f}%" if _tbr_5m is not None else "?"
+            _tbr_pct_15m = f"{_tbr_15m*100:.0f}%" if _tbr_15m is not None else "?"
+            _tbr_dir_5m = "买方进攻" if _tbr_5m is not None and _tbr_5m > 0.55 else ("卖方进攻" if _tbr_5m is not None and _tbr_5m < 0.45 else "均衡")
+            _tbr_dir_15m = "买方主导" if _tbr_15m is not None and _tbr_15m > 0.55 else ("卖方主导" if _tbr_15m is not None and _tbr_15m < 0.45 else "均衡")
+
             _funding_block = f"[资金面] L/S多空比={_ls if _ls is not None else '?'}"
-            if _oi_chg is not None:
-                _funding_block += f" | OI变化={_oi_str}({_oi_dir})"
-            else:
-                _funding_block += " | OI变化=暂无"
-            if _tbr is not None:
-                _funding_block += f" | 主动买卖比={_tbr:.2f}({_taker_dir})"
+            _funding_block += f" | OI变化:15m={_oi_15m_str} 1h={_oi_1h_str}"
+            _funding_block += f" | Taker买方占比:5m={_tbr_pct_5m}({_tbr_dir_5m}) 15m={_tbr_pct_15m}({_tbr_dir_15m})"
             _funding_block += "\n\n"
 
         # ── 市场情绪警报（仅在触发时注入，token 友好）──
@@ -1056,12 +1322,23 @@ class SmartAIConsultant:
         if sentiment_alert:
             _sent_alert_block = f"[情绪警报]{sentiment_alert}\n\n"
 
+        # ── CVD 累积成交量差（零额外计算，vs_status已有完整数据）──
+        _cvd_delta = vs_status.get("cum_delta", 0) if vs_status else 0
+        _cvd_trend = vs_status.get("delta_trend", "") if vs_status else ""
+        if _cvd_delta != 0:
+            _cvd_dir = "净买" if _cvd_delta > 0 else "净卖"
+            _cvd_trend_label = f"({_cvd_trend})" if _cvd_trend and _cvd_trend != "数据积累中" else ""
+            _cvd_line = f"CVD趋势: 近15min {_cvd_dir}{abs(_cvd_delta):.0f}张{_cvd_trend_label}"
+        else:
+            _cvd_line = "CVD趋势: 均衡(无明显方向)"
+
         user_prompt = (
             f"{aggressive_context}"
-            f"你是ETH量化交易顾问。根据以下指标判断交易动作。\n\n"
+            f"{_risk_block}"
             f"[微观]{micro_block}\n\n"
             f"[盘口] 失衡={_imbal:.2f} 斜率={_sr:.2f} {wall_str}\n\n"
-            f"[K线序列]{kline_str}\n\n"
+            f"[K线序列]{kline_str}\n{tf_align_block}\n"
+            f"[CVD]{_cvd_line}\n\n"
             f"[持仓]{pos_str}\n"
             f"{stop_block}\n"
             f"{fast_context}\n"
@@ -1076,22 +1353,9 @@ class SmartAIConsultant:
             f"[1h]  rsi={ind_1h.get('rsi',50):.1f} macd={ind_1h.get('macd_hist',0):.4f} ema={ind_1h.get('ema_bull','?')}\n"
             f"[4h]  rsi={ind_4h.get('rsi',50):.1f} macd={ind_4h.get('macd_hist',0):.4f} ema={ind_4h.get('ema_bull','?')}\n"
             f"现价:{price_now:.2f} | 市场:{_market_mode}(BB={_bb_w*100:.1f}%) | 评分:{score_desc}({sc:.2f}) | {mode_hint}\n"
-            f"恐贪={fg_index.get('value',50)} | 资金费={funding.get('funding_rate',0)*100:+.3f}%\n"
-            f"{levels_str if levels_str else '关键位:暂无'}\n\n"
-            f"[决策原则]\n"
-            f"1.微观优先：VSpike/盘口/OB结构是第一信号，宏观指标仅作确认。\n"
-            f"2.若微观数据矛盾（如VSpike突增但盘口失衡中性/反向），直接hold。\n"
-            f"3.极端量能(>10x)时优先结合CVD/流量方向表态，不要因为RSI超买/超卖就hold。\n"
-            f"4.规则引擎信号仅作参考，你可自由否决。若数据不支持（RSI/盘口/量能矛盾），直接hold。\n"
-            f"4.方向中性：只看信号强度，不追涨杀跌。\n"
-            f"5.止损必给：open必须同时给suggested_sl和suggested_tp。\n"
-            f"6.关键位锚定：止损优先锚定最近支撑/阻力，再考虑ATR。\n"
-            f"7.数据自洽：说超买需RSI>=70(震荡>=65)，背离需div=bullish/bearish。\n"
-            f"8.趋势市顺势追击，震荡市均值回归。\n"
-            f"9.新闻/资金面可作为辅助确认，但需与微观数据自洽。\n\n"
-            f"只输出JSON:\n"
-            f'{{"action":"","confidence":0.0~1.0,"suggested_sl":数值,"suggested_tp":数值,'
-            f'"suggested_leverage":1~{CFG.max_leverage},"reason":"一句话","wait_seconds":0~300}}'
+            + _build_funding_rate_line(funding, funding_history) + "\n"
+            + _build_key_level_distance(key_levels, price_now) + "\n"
+            # 决策原则和输出格式已移至 System Prompt，避免每次重复发送 ~600 tokens
         )
         return user_prompt, allowed_actions
 
@@ -1101,14 +1365,15 @@ class SmartAIConsultant:
                                 prev_market_mode: Optional[str] = None,
                                 fast_context: str = "",
                                 # ── 预计算值（由 get_decision 顶部算好再传入）────────────────
-                                _osc_market: Optional[str] = None) -> tuple:
+                                _osc_market: Optional[str] = None,
+                                vs_status: Optional[Dict] = None) -> tuple:
         price_now = ind_15m.get("price", 0)
         has_pos   = bool(pos_info.get("side"))
         _bb_upper = ind_15m.get("bb_upper", 0)
         _bb_lower = ind_15m.get("bb_lower", 0)
         _bb_price = price_now or 1
         _bb_w     = (_bb_upper - _bb_lower) / _bb_price if _bb_upper > 0 else 0
-        _market_mode = _osc_market if _osc_market else get_market_mode(ind_15m, _bb_price, prev_market_mode)
+        _market_mode = _osc_market if _osc_market else get_market_mode(ind_15m, _bb_price, prev_market_mode)[0]
 
         if has_pos:
             allowed_actions = ["hold", f"close_{pos_info['side']}", "adjust_sl_tp"]
@@ -1131,7 +1396,11 @@ class SmartAIConsultant:
         _imbal_n_r = depth.get('imbal_near', 0.0)
 
         micro_lines_r = []
-        micro_lines_r.append(f"VSpike={_vs_mult_r:.1f}x{' 🔥突增' if _vs_spike_r else ''}")
+        # VSpike（带累计净量标签，消除 AI 对 cum_delta 正负含义的歧义）
+        _cum_delta_r = (vs_status.get("cum_delta", 0) if vs_status else 0) or 0
+        _cum_label_r = "净买" if _cum_delta_r > 0 else ("净卖" if _cum_delta_r < 0 else "均衡")
+        _cum_str_r = f" {_cum_label_r}{abs(_cum_delta_r):.0f}张" if _cum_delta_r != 0 else ""
+        micro_lines_r.append(f"VSpike={_vs_mult_r:.1f}x{' 🔥突增' if _vs_spike_r else ''}{_cum_str_r}")
         if _vs_spike_r:
             micro_lines_r.append(f"  方向:{ind_15m.get('trend','?')}(买占50%+?需结合CVD)")
         if _sr_r >= 1.4:
@@ -1170,248 +1439,26 @@ class SmartAIConsultant:
 
 
     # 兼容旧接口
-    def _build_prompt(self, ind_15m: Dict, ind_1h: Dict, ind_4h: Dict,
-                      news_data: Dict, fg_index: Dict, funding: Dict,
-                      depth: Dict, pos_info: Dict,
-                      key_levels: Optional[Dict] = None,
-                      funding_history: Optional[List[Dict]] = None,
-                      macro_context: str = "",
-                      rag_warning: str = "",
-                      market_sentiment: Optional[Dict] = None,
-                      prev_market_mode: Optional[str] = None,
-                      sentiment_alert: str = "",
-                      fast_context: str = "") -> tuple:
-        return self._build_simple_prompt(
-            ind_15m, ind_1h, ind_4h,
-            news_data, fg_index, funding, depth, pos_info,
-            key_levels, funding_history, macro_context, rag_warning,
-            market_sentiment, prev_market_mode, sentiment_alert, fast_context,
-        )
 
-
-
-
-    # ── 子方法：投票 ───────────────────────────────────────────────────────
-    def _vote(self, r1: Dict, r2: Dict, for_exit_arbitration: bool = False) -> Dict:
-        """
-        双温度投票融合（r1=T0.25保守/Reasoner风格，r2=T0.70创意/Chat风格）。
-
-        优先级规则（P0/P1）：
-        1. 多空完全冲突（open_long vs open_short）→ 强制 hold，双模型打架不做任何方向偏倚
-        2. 任意一方要求 hold/skip → 采纳保守结果（Reasoner 否决权）
-        3. 置信度差 ≥ 0.2 → 采信高置信度方
-        4. 置信度差 < 0.2 → 强制 hold，避免在模糊信号下强行决策
-
-        ⚠️ SL/TP 处理：只取赢家完整点位，绝不融合。
-        原因：止损位是两个独立的技术判断融合，悬在半空容易被插针扫损。
-        """
-        a1, a2 = r1.get("action"), r2.get("action")
-        c1, c2 = r1.get("confidence", 0.0), r2.get("confidence", 0.0)
-        conf_gap = abs(c1 - c2)
-
-        # ── P0 Fix 1：多空完全冲突 → 强制熔断为 hold ────────────────────────
-        if {a1, a2} == {"open_long", "open_short"}:
-            log.warning(f"🚨 AI投票多空完全冲突（{a1} vs {a2}），强制熔断为 hold")
-            result = {
-                "action": "hold", "confidence": 0.0,
-                "suggested_sl": 0, "suggested_tp": 0,
-                "suggested_leverage": 1,
-                "reason": f"双温度投票多空冲突({a1} vs {a2})，强制观望",
-                "thought_process": "",
-            }
-            return self._record_vote(result, a1, a2, c1, c2, conf_gap), result
-
-        # ── P0.5：2:1 多数否决（Qwen + Reasoner 双双 hold，DeepSeek 强行开仓）──
-        # 修复：Qwen 和 Reasoner 各自 margin < 0.10 无法单独否决，
-        # 但两票多数应该否决一票开仓（防止低质量开仓）
-        _qwen_orig = r1.get("_qwen_action")
-        if (_qwen_orig and _qwen_orig in ("hold", "skip")
-                and a1 not in ("hold", "skip")
-                and a2 in ("hold", "skip")):
-            _qwen_orig_conf = r1.get("_qwen_conf", 0.5)
-            result = r2.copy()
-            if result.get("confidence", 0) == 0.0:
-                result["confidence"] = 0.5
-            log.info(
-                f"⚖️ AI投票：2:1多数否决"
-                f"（Qwen={_qwen_orig} conf={_qwen_orig_conf:.2f}"
-                f" + Reasoner={a2} conf={c2:.2f}"
-                f" vs DeepSeek={a1} conf={c1:.2f}），采保守: hold"
-            )
-            return self._record_vote(result, a1, a2, c1, c2, conf_gap), result
-
-        # ── P1：Reasoner 否决权（保守方 hold/skip 拦截创意方开仓）────────────
-        # 否决条件收紧：hold方置信度比open方高出≥0.10才生效
-        # 避免Reasoner以更低或相近的置信度无条件压制Chat的开仓信号
-        if a1 in ("hold", "skip") or a2 in ("hold", "skip"):
-            hold_res  = r1 if a1 in ("hold", "skip") else r2
-            open_res  = r2 if a1 in ("hold", "skip") else r1
-            hold_conf = c1 if a1 in ("hold", "skip") else c2
-            open_conf = c2 if a1 in ("hold", "skip") else c1
-            veto_margin = hold_conf - open_conf
-            if veto_margin >= 0.10:
-                result = hold_res
-                if result.get("confidence", 0) == 0.0:
-                    result = {**result, "confidence": 0.5}
-                log.info(f"⚖️ AI投票：Reasoner否决（{a1} vs {a2}），hold_conf={hold_conf:.2f}高出open_conf={open_conf:.2f} margin={veto_margin:.2f}≥0.10，采保守结果: hold")
-            else:
-                result = open_res
-                log.info(f"⚖️ AI投票：否决条件不足（hold_conf={hold_conf:.2f} open_conf={open_conf:.2f} margin={veto_margin:.2f}<0.10），尊重开仓信号: {open_res.get('action')} conf={open_conf:.2f}")
-            return self._record_vote(result, a1, a2, c1, c2, conf_gap), result
-
-        # ── 共识：双方一致 → 取高置信度方（全套点位继承）────────────────────
-        if a1 == a2:
-            result = r1 if c1 >= c2 else r2
-            if result.get("action") in ("hold", "skip") and result.get("confidence", 0) == 0.0:
-                result = {**result, "confidence": 0.5}
-            log.info(f"✅ AI投票共识: {a1} (conf={result.get('confidence', max(c1,c2)):.2f})")
-            return self._record_vote(result, a1, a2, c1, c2, conf_gap), result
-
-        # ── 置信度差 ≥ 0.2 → 采信高置信度方 ──────────────────────────────
-        if conf_gap >= 0.2:
-            result = r1 if c1 > c2 else r2
-            log.info(f"⚖️ AI投票分歧({a1} vs {a2})，置信度差{conf_gap:.2f}，采信 {result['action']}(conf={max(c1,c2):.2f})")
-            return self._record_vote(result, a1, a2, c1, c2, conf_gap), result
-
-        # ── 持仓分歧仲裁标记（开仓/平仓通用）────────────────────────────────
-        # 当双方分歧且置信度差 < 0.2 时，标记 need_exit_arbitration=True
-        # 调用方（eth_trader.py）检测到该标记后会触发千问仲裁
-        _exit_intents = {"close_long", "close_short", "close", "adjust_sl_tp"}
-        _is_exit_dispute = for_exit_arbitration and (
-            (a1 in _exit_intents and a2 in ("hold", "skip")) or
-            (a2 in _exit_intents and a1 in ("hold", "skip")) or
-            (a1 in _exit_intents and a2 in _exit_intents)
-        )
-
-        # ── 双方均为离场/保护意图 → 取保守动作（adjust_sl_tp 优先）────────────
-        # 避免 close_short vs adjust_sl_tp 这类"方向一致、方式不同"的分歧被强制 hold
-        _contradictory = {"close_long", "close_short"}.issubset({a1, a2})
-        if a1 in _exit_intents and a2 in _exit_intents and not _contradictory:
-            if "adjust_sl_tp" in (a1, a2):
-                result = r1 if a1 == "adjust_sl_tp" else r2
-            else:
-                result = r1 if c1 >= c2 else r2
-            if _is_exit_dispute:
-                result["_need_exit_arbitration"] = True
-                log.info(f"⚖️ AI投票：双方均为离场意图({a1} vs {a2})，差距{conf_gap:.2f}<0.2，取保守动作但标记仲裁: {result['action']}(conf={result.get('confidence',0):.2f})")
-            else:
-                log.info(f"⚖️ AI投票：双方均为离场意图({a1} vs {a2})，差距{conf_gap:.2f}<0.2，取保守动作: {result['action']}(conf={result.get('confidence',0):.2f})")
-            return self._record_vote(result, a1, a2, c1, c2, conf_gap), result
-
-        # ── 模糊信号 → 强制 hold ─────────────────────────────────────────
-        log.info(f"🚫 AI投票分歧({a1} conf={c1:.2f} vs {a2} conf={c2:.2f})，差距<0.2，强制观望")
-        result = {
-            "action": "hold", "confidence": 0.0,
-            "suggested_sl": 0, "suggested_tp": 0,
-            "suggested_leverage": 1,
-            "reason": f"双温度投票分歧({a1} vs {a2})，置信度差={conf_gap:.2f}<0.2",
-            "thought_process": f"保守:{r1.get('reason','')} | 创意:{r2.get('reason','')}",
-        }
-        if _is_exit_dispute:
-            result["_need_exit_arbitration"] = True
-            result["_dispute_actions"] = [a1, a2]
-            result["_dispute_confs"] = [c1, c2]
-            log.info(f"📎 [{a1} vs {a2}] 投票分歧标记仲裁（hold vs close 模糊冲突）")
-        return self._record_vote(result, a1, a2, c1, c2, conf_gap), result
-
-    def _record_vote(self, result: Dict, a1: str, a2: str, c1: float, c2: float, conf_gap: float) -> Dict:
-        """将投票结果写入结构化日志（JSON 格式），供回溯分析。"""
-        try:
-            decision_record = {
-                "ts": datetime.now(UTC).isoformat(),
-                "action": result.get("action"),
-                "confidence": result.get("confidence"),
-                "suggested_leverage": result.get("suggested_leverage"),
-                "suggested_sl": result.get("suggested_sl"),
-                "suggested_tp": result.get("suggested_tp"),
-                "reason": (result.get("reason") or "")[:120],
-                "pyramid_plan": result.get("pyramid_plan"),
-                "vote_r1_action": a1, "vote_r1_conf": round(c1, 3),
-                "vote_r2_action": a2, "vote_r2_conf": round(c2, 3),
-                "conf_gap": round(conf_gap, 3),
-            }
-            log.info(f"[AI_DECISION] {json.dumps(decision_record, ensure_ascii=False)}")
-        except Exception:
-            pass
-        return result
-
-    # ── P2 辅助：持仓PnL计算 ──────────────────────────────────────────────
-    def get_pnl_pct(self, pos_info: Dict, current_price: float) -> float:
-        """计算当前持仓浮盈/浮亏百分比（正=盈利，负=亏损）。"""
-        if not pos_info or not pos_info.get("side") or not pos_info.get("entry_price"):
-            return 0.0
-        if current_price <= 0:
-            return 0.0
-        entry = float(pos_info["entry_price"])
-        if pos_info["side"] == "long":
-            return (current_price - entry) / entry
-        else:
-            return (entry - current_price) / entry
-
-    def get_roe_pct(self, pos_info: Dict, current_price: float) -> float:
-        """计算权益回报率 = 价格变动 × 杠杆（含双边手续费估算）。"""
-        fee_estimate = 0.0005   # 双边手续费估算（约 0.05%）
-        pnl_pct = self.get_pnl_pct(pos_info, current_price)
-        lev = float(pos_info.get("leverage", 1))
-        return (pnl_pct - fee_estimate) * lev
-
-    # ── P2 核心：Reasoner 按需触发判断 ─────────────────────────────────
-    def _should_use_reasoner(self, pos_info: Dict, ind_15m: Dict,
-                             prev_market_mode: str, current_price: float) -> bool:
-        """
-        判断本次决策是否需要 deepseek-reasoner 的强逻辑能力。
-        极端场景（连亏/持仓深度浮亏/趋势市高波动）→ 用 Reasoner 做一票否决兜底。
-        普通场景 → 只用 deepseek-chat，省 token。
-        """
-        # ── 频率限制：距上次 Reasoner 调用 ≥ 冷却期 ──
-        _last_reasoner_ts = gs_get("last_reasoner_ts", 0.0)
-        _reasoner_cd = getattr(CFG, "reasoner_min_interval_sec", 0)
-        if _reasoner_cd > 0 and (time.monotonic() - _last_reasoner_ts) < _reasoner_cd:
-            return False
-
-        pnl = self.get_pnl_pct(pos_info, current_price)
-        roe = self.get_roe_pct(pos_info, current_price)
-        market = prev_market_mode or "震荡"
-        ind = ind_15m or {}
-
-        # 条件1：连续亏损 ≥ 阈值（需要强逻辑复盘）
-        if gs_get("consecutive_losses", 0) >= CFG.reasoner_consec_loss_thresh:
-            gs_set("last_reasoner_ts", time.monotonic())
-            return True
-
-        # 条件2：ROE ≤ 阈值（合约杠杆感知，仅持仓时生效）
-        # 新增 PNL 地板：累计浮亏需 ≥ REASONER_MIN_PNL_PCT 才触发
-        if pos_info.get("side"):
-            _min_pnl = getattr(CFG, "reasoner_min_pnl_pct", -100.0)
-            if pnl <= _min_pnl and roe <= CFG.reasoner_roe_thresh:
-                gs_set("last_reasoner_ts", time.monotonic())
-                return True
-
-        # 条件3：趋势市 + 高波动（趋势行情高波动时才需要强逻辑）
-        atr_ratio = ind.get("atr_ratio", 1.0) if ind else 1.0
-        if market == "趋势" and atr_ratio > CFG.reasoner_atr_ratio_thresh:
-            gs_set("last_reasoner_ts", time.monotonic())
-            return True
-
-        # 默认：普通场景/震荡市只用 deepseek-chat（Qwen 并行已覆盖第二意见）
-        return False
 
     # ── P2 改造：_single_call 支持 model 参数 ─────────────────────────────────
     def _single_call(self, temperature: float, user_prompt: str,
                      allowed_actions: List[str],
-                     model: str = "deepseek-chat") -> Dict:
+                     model: str = "deepseek-chat",
+                     system_prompt: str = None) -> Dict:
         """执行单次 AI 调用并解析返回的决策。model 默认为 deepseek-chat。"""
+        _sys = system_prompt if system_prompt else SYSTEM_PROMPT_TRADE
 
         # ── deepseek-reasoner 专用路径（不接受 temperature，输出 <think>+JSON）────
         if model == "deepseek-reasoner":
             _msgs = [
-                {"role": "system", "content": SYSTEM_PROMPT_TRADE},
+                {"role": "system", "content": _sys},
                 {"role": "user",   "content": user_prompt},
             ]
             _result = _call_reasoner_for_json(
                 self.client, _msgs,
                 max_tokens=4000,   # 限制 token 数，超出部分被截断
-                timeout=60,         # 硬限 60s，超时抛异常让外层 fallback 到 r1
+                timeout=CFG.reasoner_timeout_seconds,
             )
             if _result.get("action") not in allowed_actions:
                 log.warning(f"AI({model})输出了不允许的动作 {_result.get('action')}，强制改为 hold")
@@ -1426,7 +1473,7 @@ class SmartAIConsultant:
                 model=model,
                 max_tokens=1000,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_TRADE},
+                    {"role": "system", "content": _sys},
                     {"role": "user",   "content": user_prompt},
                 ],
                 temperature=temperature,
@@ -1473,8 +1520,18 @@ class SmartAIConsultant:
             else:
                 json_part = content
 
-        result = _parse_llm_json(json_part)
+        # ── L1 Pydantic 优先解析（严格 schema 校验）──────────────────────
+        try:
+            validated = TradeDecisionModel.model_validate_json(json_part)
+            result = validated.model_dump()
+        except Exception as e:
+            log.debug(f"[L1 Pydantic] model_validate_json 失败，fallback 到老解析器: {e}")
+            result = _parse_llm_json(json_part)
         result["thought_process"] = thought.strip()
+        if result.get("confidence") is not None:
+            result["confidence"] = max(0.0, min(1.0, float(result["confidence"])))
+
+        # ── action 白名单校验（兜底防护）──────────────────────────────────
         if isinstance(result.get("action"), str):
             result["action"] = result["action"].strip().lower()
         if result.get("action") not in allowed_actions:
@@ -1485,7 +1542,7 @@ class SmartAIConsultant:
                  f"| thought={len(thought)}chars")
         return result
 
-    # ── 主方法：AI 决策入口 ─────────────────────────────────────────────────
+    # ── 主方法：AI 决策入口（三层模型架构）────────────────────────────────────
     def get_decision(self, ind_15m: Dict, ind_1h: Dict, ind_4h: Dict,
                      news_data: Dict, fg_index: Dict, funding: Dict,
                      depth: Dict, pos_info: Dict,
@@ -1502,32 +1559,34 @@ class SmartAIConsultant:
                      trend_dir: str = "neutral",
                      vs_status: Optional[Dict] = None) -> Dict:
         """
-        AI 决策主流程（并行投票版）：
-        - deepseek-chat T=0.35：主力（快速稳定）
-        - Qwen：条件并行第二意见（震荡/震荡激进 + 低置信度）
-        - deepseek-reasoner：极端场景一票否决（连亏/高波动/刚止损）
+        三层模型调用架构：
+        L1 (DeepSeek-Chat)：主力快速决策，每次轮询无条件调用
+        L2 (Qwen)：第二意见/仲裁，仅当 L1 开仓且 conf < 0.85 时调用
+        L3 (Reasoner)：一票否决，仅当共识开仓且极端场景(VSpike≥5.0 / trending+ATR≥1.5)时调用
         """
         last_attempt_err = None
-        # ── 注入趋势对齐分数到 prompt ─────────────────────────────────────
+        _exit_intents = {"close_long", "close_short", "close", "adjust_sl_tp"}
+
+        # ── 预计算 market_mode（供 prompt 和 L3 触发共用）───────────────────
+        _price_bb = ind_15m.get("price", 0) or 1
+        _osc_pre = get_market_mode(ind_15m, _price_bb, prev_market_mode)[0]
+
+        # ── 构建增强版 System Prompt（静态内容，hash 缓存，每天重建 2-4 次）──
+        _system_prompt = get_system_prompt(
+            macro_context=macro_context,
+            key_levels=key_levels,
+            funding_history=funding_history,
+        )
+
+        # ── 注入趋势对齐分数到 fast_context ────────────────────────────────
         _trend_inj = f"趋势对齐分数：{trend_alignment_score:.2f}（1.0=极强顺势），方向：{trend_dir}。"
         fast_context = (_trend_inj + "\n\n" + (fast_context or "")).strip()
 
-        # ── 预计算 market_mode 和 period_score（仅算一次，供两个 prompt 共用）────
-        _price_bb = ind_15m.get("price", 0) or 1
-        _osc_pre  = get_market_mode(ind_15m, _price_bb, prev_market_mode)
-        _sc_pre, _desc_pre = _calc_period_score(ind_15m, ind_1h, ind_4h)
-
-        # ── Qwen 并行触发条件：无需 fd_score（此时还未算），用原始指标代替 ──
-        _vol_for_qwen = ind_15m.get("vol_surge", 1.0)
-        _adx_for_qwen = ind_15m.get("adx", 0)
-        _qwen_trigger = (
-            _osc_pre in ("震荡", "震荡激进")
-            or _vol_for_qwen < 0.7  # 缩量，信号边缘
-        )
-
         for attempt in range(max(1, CFG.ai_max_retries)):
             try:
-                # ── Step A: 精简 prompt + deepseek-chat T=0.35 主力 ─────────
+                # ═══════════════════════════════════════════════════════
+                # L1: DeepSeek-Chat（主力快速决策，每次无条件调用）
+                # ═══════════════════════════════════════════════════════
                 simple_prompt, allowed_actions = self._build_simple_prompt(
                     ind_15m, ind_1h, ind_4h, news_data, fg_index, funding,
                     depth, pos_info, key_levels, funding_history,
@@ -1535,182 +1594,249 @@ class SmartAIConsultant:
                     prev_market_mode, sentiment_alert,
                     fast_context=fast_context,
                     aggressive_context=aggressive_context,
-                    _osc_market=_osc_pre, _period_score=_sc_pre, _score_desc=_desc_pre,
+                    _osc_market=_osc_pre,
+                    vs_status=vs_status,
+                    _system_prompt=_system_prompt,
                 )
                 chat_temp = 0.35 if _osc_pre in ("震荡", "震荡激进") else 0.25
-                log.info(f"📊 [{CFG.symbol}] deepseek-chat T={chat_temp}（{_osc_pre}）")
+                log.info(f"📊 [{CFG.symbol}] L1 DeepSeek-Chat T={chat_temp}（{_osc_pre}）")
                 r1 = self._single_call(chat_temp, simple_prompt, allowed_actions,
-                                        model="deepseek-chat")
-                a1 = r1.get("action", "hold")
+                                        model="deepseek-chat",
+                                        system_prompt=_system_prompt)
+                l1_action = r1.get("action", "hold")
+                l1_conf = r1.get("confidence", 0.0)
+                log.info(f"L1 原始决策: {l1_action} conf={l1_conf:.2f}")
 
-                # hold 直接采纳（AGGRESSIVE 模式下低置信度需二次验证）
-                if a1 in ("hold", "skip"):
-                    _r1_conf = r1.get("confidence", 0)
-                    if aggressive_context and _r1_conf < 0.3:
-                        log.info(
-                            f"🤖 Chat(T{chat_temp}): {a1} conf={_r1_conf:.2f}"
-                            f" — AGGRESSIVE模式低置信度，升级至Qwen/Reasoner验证"
-                        )
-                    else:
-                        log.info(f"🤖 Chat(T{chat_temp}): {a1} conf={_r1_conf:.2f} — 直接采纳")
-                        gs_set("ai_consecutive_timeout", 0)
-                        return r1
-
-                # ── Step B: 条件并行 Qwen 第二意见 ─────────────────────────
-                # AGGRESSIVE 模式强制 Qwen（有持仓+hold 时 Qwen 替代 Reasoner）
-                if aggressive_context:
-                    _qwen_trigger = True
-                qwen_result = None
-                if _qwen_trigger:
-                    with ThreadPoolExecutor(max_workers=2) as pool:
-                        qwen_future = pool.submit(
-                            self._call_qwen_decision,
-                            simple_prompt, allowed_actions, _osc_pre, a1
-                        )
-                        try:
-                            qwen_result = qwen_future.result(timeout=15)
-                        except FuturesTimeout:
-                            log.debug("⏱️ Qwen 并行调用超时(15s)，降级为仅 chat")
-                            qwen_result = None
-
-                    if qwen_result:
-                        _qa = qwen_result.get("action", "hold")
-                        _qc = qwen_result.get("confidence", 0.5)
-                        _da = r1.get("action", "hold")
-                        _dc = r1.get("confidence", 0.5)
-                        log.info(f"🔵 Qwen第二意见: {_qa} conf={_qc:.2f} | DeepSeek: {_dc:.2f}→{_da}")
-
-                        # Qwen 作为真正的投票者，与 DeepSeek 进行投票决议
-                        if _qa == _da:
-                            # 共识：取高置信度
-                            if _qc > _dc:
-                                r1["confidence"] = round(_qc, 3)
-                            log.info(f"✅ Qwen+DeepSeek共识: {_da} conf={r1['confidence']:.2f}")
-                        else:
-                            _conf_gap = abs(_dc - _qc)
-                            _exit_intents = {"close_long", "close_short", "close", "adjust_sl_tp"}
-
-                            # 规则1：一方 hold/skip vs 另一方 exit → hold方需高出 ≥0.10 才否决
-                            if (_qa in ("hold", "skip")) != (_da in ("hold", "skip")):
-                                hold_act = _qa if _qa in ("hold", "skip") else _da
-                                hold_conf = _qc if _qa in ("hold", "skip") else _dc
-                                open_act = _da if _qa in ("hold", "skip") else _qa
-                                open_conf = _dc if _qa in ("hold", "skip") else _qc
-                                veto_margin = hold_conf - open_conf
-                                if veto_margin >= 0.10:
-                                    r1["action"] = hold_act
-                                    r1["confidence"] = round(max(hold_conf, 0.5), 3)
-                                    log.info(f"⚖️ Qwen否决：{hold_act}(conf={hold_conf:.2f})高出{open_act}(conf={open_conf:.2f}) margin={veto_margin:.2f}≥0.10")
-                                else:
-                                    log.info(f"⚖️ Qwen否决不足：hold_conf={hold_conf:.2f} open_conf={open_conf:.2f} margin={veto_margin:.2f}<0.10，保留{_da}")
-                            # 规则2：置信度差 ≥ 0.2 → 采信高置信度方
-                            elif _conf_gap >= 0.2:
-                                if _qc > _dc:
-                                    r1["action"] = _qa
-                                    r1["confidence"] = round(_qc, 3)
-                                    log.info(f"⚖️ Qwen胜：{_qa}(conf={_qc:.2f}) 差距{_conf_gap:.2f}≥0.2")
-                                else:
-                                    log.info(f"⚖️ DeepSeek胜：{_da}(conf={_dc:.2f}) 差距{_conf_gap:.2f}≥0.2")
-                            # 规则3：持仓分歧（exit vs hold，差距<0.2）→ 标记仲裁
-                            elif bool(pos_info.get("side")) and (
-                                (_da in _exit_intents and _qa in ("hold", "skip")) or
-                                (_qa in _exit_intents and _da in ("hold", "skip"))
-                            ):
-                                r1["_need_exit_arbitration"] = True
-                                r1["_dispute_actions"] = [_da, _qa]
-                                r1["_dispute_confs"] = [_dc, _qc]
-                                log.info(f"⚖️ Qwen持仓分歧：{_da}(conf={_dc:.2f}) vs {_qa}(conf={_qc:.2f})，标记仲裁")
-                            # 规则4：模糊分歧 → 强制 hold
-                            else:
-                                r1["action"] = "hold"
-                                r1["confidence"] = 0.0
-                                log.info(f"🚫 Qwen模糊分歧：{_da}(conf={_dc:.2f}) vs {_qa}(conf={_qc:.2f})，强制观望")
-                                # AGGRESSIVE 模式冲突 → 记录冷却快照
-                                if aggressive_context:
-                                    _vs_cd = vs_status or {}
-                                    gs_set("last_aggressive_conflict_ts", time.monotonic())
-                                    gs_set("last_aggressive_conflict_dir", _vs_cd.get("direction", ""))
-
-                        r1["reason"] = f"{r1.get('reason','')} [Qwen:{qwen_result.get('reason','')}]"
-                        r1["_qwen_action"] = _qa
-                        r1["_qwen_conf"] = _qc
-
-                # ── Step C: 极端场景 reasoner 一票否决 ────────────────────
-                # AGGRESSIVE 分场景：无持仓/开平仓信号 → 必用 Reasoner
-                #                    有持仓+hold → Qwen 已足够，省 ~50s 延迟
-                use_reasoner = self._should_use_reasoner(
-                    pos_info, ind_15m, prev_market_mode,
-                    depth.get("mid_price", 0) if depth else 0
+                # ── 统一 L2 Qwen 触发判断 ──
+                _has_strong_signal = any(kw in (fast_context or "") for kw in (
+                    "规则引擎参考信号", "打板信号", "快速决策", "🔥 秒级成交量突增",
+                ))
+                _has_grade_signal = any(kw in (fast_context or "") for kw in ("S级", "A级"))
+                _need_l2 = (
+                    (l1_action not in ("hold", "skip") and l1_conf < 0.80)
+                    or (l1_action in ("hold", "skip") and (_has_strong_signal or _has_grade_signal))
+                    or (_osc_pre == "趋势" and l1_action in ("hold", "skip") and l1_conf < 0.85)
                 )
 
-                # Qwen+Chat 共识 hold → 跳过 Reasoner（即使极端场景触发）
-                if qwen_result and r1.get("action") in ("hold", "skip") and _qa in ("hold", "skip"):
-                    use_reasoner = False
-                    log.info(f"⚡ Qwen+DeepSeek共识hold，跳过Reasoner节省延迟")
+                if not _need_l2:
+                    if l1_action in ("hold", "skip"):
+                        log.info(f"✅ L1 决定 {l1_action}，直接采纳，跳过 L2/L3")
+                    else:
+                        log.info(f"✅ L1 高置信度({l1_conf:.2f}≥0.80)，跳过 L2")
+                    gs_set("ai_consecutive_timeout", 0)
+                    return r1
 
-                if aggressive_context and not use_reasoner:
-                    _has_pos = bool(pos_info.get("side"))
-                    if not _has_pos or a1 not in ("hold", "skip"):
-                        use_reasoner = True
+                # L2 触发原因
+                if l1_action in ("hold", "skip") and (_has_strong_signal or _has_grade_signal):
+                    _sig_label = "S/A级" if _has_grade_signal else "规则/打板"
+                    log.info(f"⚠️ L1 决定 {l1_action}，但 fast_context 存在{_sig_label}强信号，转 L2 Qwen 仲裁")
+                elif l1_action in ("hold", "skip") and _osc_pre == "趋势":
+                    log.info(f"⚠️ L1 决定 {l1_action}，但当前为趋势市，调 Qwen 补漏检查")
+                else:
+                    log.info(f"📝 L1 conf={l1_conf:.2f}<0.80，调用 L2 Qwen 仲裁")
+
+                # ── close/adjust → 逃生通道直接执行，不等 L2/L3 ──
+                if l1_action in _exit_intents:
+                    log.info(f"✅ L1 决定 {l1_action}(conf={l1_conf:.2f})，逃生通道直接执行")
+                    gs_set("ai_consecutive_timeout", 0)
+                    return r1
+
+                # ═══════════════════════════════════════════════════════
+                # L2: Qwen 仲裁（持仓 close 且 L1 conf≥0.68 → 直接放行，不等 L2）
+                # ═══════════════════════════════════════════════════════
+                final_action = l1_action
+                final_conf = l1_conf
+                final_reason = r1.get("reason", "")
+
+                _is_close_l1 = l1_action in ("close_short", "close_long", "close")
+                if _is_close_l1 and l1_conf >= 0.68:
+                    log.info(f"✅ L1 close 置信度达标 ({l1_action} conf={l1_conf:.2f}≥0.68)，跳过 L2 仲裁，直接执行")
+                    gs_set("ai_consecutive_timeout", 0)
+                    return r1
+
+                qwen_result = None
+                # Qwen 内部已 try/except 返回 None，最多重试2次
+                for _qwen_attempt in range(2):
+                    qwen_result = self._call_qwen_decision(
+                        simple_prompt, allowed_actions, _osc_pre, l1_action,
+                        cvd_delta=(vs_status.get("cum_delta", 0.0) if vs_status else 0.0),
+                        trend_score=trend_alignment_score,
+                    )
+                    if qwen_result:
+                        break
+                    log.debug(f"Qwen 未返回，第{_qwen_attempt+1}/2次重试")
+
+                if qwen_result:
+                    q_action = qwen_result.get("action", "hold")
+                    q_conf = qwen_result.get("confidence", 0.5)
+                    log.info(f"🔵 L2 Qwen: {q_action} conf={q_conf:.2f}")
+
+                    # ── 强否决：Qwen 方向相反且 conf ≥ 0.75 ──
+                    if q_action != l1_action and q_conf >= 0.82:
+                        log.warning(
+                            f"🚫 Qwen 强否决：L1={l1_action}(conf={l1_conf:.2f}) "
+                            f"vs Qwen={q_action}(conf={q_conf:.2f}≥0.75)，采纳 Qwen"
+                        )
+                        final_action = "hold"
+                        final_conf = q_conf
+                        final_reason = f"[Qwen否决L1] {qwen_result.get('reason', '')}"
+                        r1["action"] = "hold"
+                        r1["confidence"] = q_conf
+                        r1["reason"] = final_reason
+                    # ── 方向相同 → 共识，取平均置信度 ──
+                    elif q_action == l1_action:
+                        final_conf = (l1_conf + q_conf) / 2
+                        final_reason = f"{r1.get('reason','')} [Qwen:{qwen_result.get('reason','')}]"
+                        log.info(f"✅ L1+L2 共识: {l1_action} conf={final_conf:.2f}")
+                        r1["confidence"] = round(final_conf, 3)
+                        r1["reason"] = final_reason
+                    # ── 方向不同但未达强否决 → 分歧处理 ──
+                    else:
+                        # ── 趋势市优先通道：Qwen 明确方向性信号且 conf≥0.60 → 采用 Qwen 方向 ──
+                        if (_osc_pre == "趋势" and q_action != "hold"
+                                and q_conf >= 0.60):
+                            final_conf = q_conf
+                            final_reason = (
+                                f"{r1.get('reason','')} "
+                                f"[趋势市采纳Qwen方向:{q_action} conf={q_conf:.2f}]"
+                            )
+                            log.info(
+                                f"⚖️ L1+L2 分歧（趋势市采纳Qwen）：L1={l1_action}(conf={l1_conf:.2f}) "
+                                f"vs Qwen={q_action}(conf={q_conf:.2f}≥0.60)，"
+                                f"采用 Qwen 方向 conf={final_conf:.2f}"
+                            )
+                            r1["action"] = q_action
+                            r1["confidence"] = round(final_conf, 3)
+                            r1["reason"] = final_reason
+                        else:
+                            # 非趋势市或 Qwen 方向性不足 → 保留 L1，按信心差距动态降权
+                            _conf_gap = abs(l1_conf - q_conf)
+                            if l1_conf > q_conf:
+                                # L1 更自信：信心差距越大，降权越小（Qwen 信心不足，分歧权重低）
+                                final_conf = l1_conf * max(0.78, 1.0 - _conf_gap * 0.5)
+                            else:
+                                # Qwen 更自信但未达强否决线：较大降权
+                                final_conf = l1_conf * 0.72
+                            final_reason = f"{r1.get('reason','')} [Qwen分歧:{q_action} conf={q_conf:.2f}]"
+                            log.info(
+                                f"⚖️ L1+L2 弱分歧：L1={l1_action}(conf={l1_conf:.2f}) "
+                                f"vs Qwen={q_action}(conf={q_conf:.2f})，"
+                                f"保留 L1 动态降权 conf={final_conf:.2f}"
+                            )
+                            r1["confidence"] = round(final_conf, 3)
+                            r1["reason"] = final_reason
+
+                    r1["_qwen_action"] = q_action
+                    r1["_qwen_conf"] = q_conf
+                else:
+                    log.info(f"⚠️ Qwen 未返回，仅用 L1: {l1_action} conf={l1_conf:.2f}")
+
+                # ═══════════════════════════════════════════════════════
+                # L3: Reasoner 一票否决（极端场景 + per-symbol 冷却）
+                # ═══════════════════════════════════════════════════════
+                use_reasoner = False
+                _sym_key = f"reasoner_usage_{CFG.symbol}"
+                _reasoner_stats = gs_get(_sym_key, {"count": 0, "window_start": 0.0})
+                _now_s = time.monotonic()
+                _window = 15 * 60  # 15分钟滚动窗口
+
+                if _now_s - _reasoner_stats["window_start"] > _window:
+                    _reasoner_stats = {"count": 0, "window_start": _now_s}
+
+                # ── 提前初始化 VSpike 变量（供 L3 触发判断 + 后续方向守卫共用）──
+                _vs = vs_status or {}
+                _vs_mult = _vs.get("mult", 0.0)
+                _vs_dir = _vs.get("direction", "")
+                _vs_buy_pct = _vs.get("buy_pct", 0.5)
+
+                # 共识 hold → 不需要 Reasoner
+                if r1.get("action") in ("hold", "skip"):
+                    use_reasoner = False
+                elif _reasoner_stats["count"] >= 2:
+                    log.info(f"⏳ Reasoner cooldown（{CFG.symbol}，15min内已达2次上限）")
+                    use_reasoner = False
+                else:
+                    # 【持仓场景跳过 L3】持仓翻转需要果断平仓，不是深度思考
+                    if pos_info.get("side"):
+                        use_reasoner = False
+                        log.debug(
+                            f"⏭️ [{CFG.symbol}] 持仓场景，跳过 L3 Reasoner（避免超时拖延平仓）"
+                        )
+                    else:
+                        _atr_ratio = ind_15m.get("atr_ratio", 1.0) if ind_15m else 1.0
+                        _regime = ind_15m.get("regime_score", 0.5) if ind_15m else 0.5
+
+                        # 触发条件1：VSpike ≥ 10.0 + 极强趋势（regime < 0.20）
+                        if _vs_mult >= 10.0 and _regime < 0.20:
+                            use_reasoner = True
+                            _reasoner_stats["count"] += 1
+                            log.info(f"🔥 L3 触发（黑天鹅防护）：VSpike={_vs_mult:.1f}x + Regime={_regime:.2f}<0.20")
+
+                        # 触发条件2：趋势市 + ATR ≥ 2.8
+                        elif _osc_pre == "趋势" and _atr_ratio >= 2.8:
+                            use_reasoner = True
+                            _reasoner_stats["count"] += 1
+                            log.info(f"🔥 L3 触发（黑天鹅防护）：趋势市 + ATR={_atr_ratio:.2f} ≥ 2.8")
+
+                        gs_set(_sym_key, _reasoner_stats)
+
                 if use_reasoner:
                     reasoner_prompt, _ = self._build_reasoner_prompt(
                         ind_15m, ind_1h, ind_4h,
                         funding, depth, pos_info,
                         prev_market_mode, fast_context,
                         _osc_market=_osc_pre,
+                        vs_status=vs_status,
                     )
-                    log.info(f"🧠 极端场景 → deepseek-reasoner（一票否决）")
-                    r2 = self._single_call(0.35, reasoner_prompt, allowed_actions,
-                                            model="deepseek-reasoner")
-                    # reasoner 一票否决：如果和 chat 方向冲突，投票决定
-                    _, result = self._vote(r1, r2, for_exit_arbitration=False)
-                    # AGGRESSIVE 模式 Reasoner 冲突 → 记录冷却快照
-                    if aggressive_context and result.get("action") == "hold" and result.get("confidence", 0) == 0.0:
-                        _vs_cd2 = vs_status or {}
-                        gs_set("last_aggressive_conflict_ts", time.monotonic())
-                        gs_set("last_aggressive_conflict_dir", _vs_cd2.get("direction", ""))
+                    log.info(f"🧠 L3 deepseek-reasoner 一票否决")
+                    try:
+                        r3 = self._single_call(0.35, reasoner_prompt, allowed_actions,
+                                                model="deepseek-reasoner")
+                        r3_action = r3.get("action", "hold")
+                        r3_conf = r3.get("confidence", 0.5)
+                        log.info(f"L3 Reasoner: {r3_action} conf={r3_conf:.2f}")
+
+                        # 一票否决：Reasoner 方向相反且 conf ≥ 0.65
+                        if r3_action != final_action and r3_conf >= 0.65:
+                            log.warning(
+                                f"🚫 Reasoner 一票否决：L1/L2={final_action}(conf={final_conf:.2f}) "
+                                f"vs Reasoner={r3_action}(conf={r3_conf:.2f}≥0.65)，改为 hold"
+                            )
+                            r1["action"] = "hold"
+                            r1["confidence"] = r3_conf
+                            r1["reason"] = f"[Reasoner否决] {r3.get('reason', '')}"
+                        else:
+                            log.info(f"✅ Reasoner 未否决，维持 {final_action} conf={final_conf:.2f}")
+                            r1["reason"] = f"{r1.get('reason','')} [Reasoner:{r3.get('reason','')}]"
+                        r1["_reasoner_action"] = r3_action
+                        r1["_reasoner_conf"] = r3_conf
+                    except Exception as e:
+                        log.warning(f"⚠️ L3 Reasoner 调用失败: {e}，跳过一票否决，维持 {final_action}")
+                        r1["reason"] = f"{r1.get('reason','')} [Reasoner:调用失败]"
+                    result = r1.copy()
                 else:
                     result = r1.copy()
 
                 gs_set("ai_consecutive_timeout", 0)
 
-                # ── 持仓分歧千问仲裁 ──────────────────────────────────────
-                has_pos = bool(pos_info.get("side"))
-                if has_pos and result.get("_need_exit_arbitration"):
-                    _vs = ind_15m.get("vol_surge", 1.0)
-                    _ob = depth.get("imbalance", 0.0) if hasattr(depth, "get") else 0.0
-                    arb_result = self._arbitrate_exit_dispute(
-                        r1, result, r1.get("action", ""), result.get("action", ""),
-                        r1.get("confidence", 0.0), result.get("confidence", 0.0),
-                        pos_info, ind_15m, _osc_pre, _vs, _ob,
-                    )
-                    log.info(f"⚖️ 千问仲裁裁决持仓分歧: {arb_result['action']}(conf={arb_result['confidence']:.2f})")
-                    result = arb_result
-
-                # ── VSpike 方向守卫：AGGRESSIVE 模式下硬拦截反向开仓 ──────────
-                # 三重确认：VSpike ≥15x + 方向相反 + buy_pct 极端 → 否决
-                _vs = vs_status or {}
+                # ── VSpike 方向守卫：极端反向量能硬拦截 ──
                 _vs_dir = _vs.get("direction", "")
-                _vs_mult_g = _vs.get("mult", 0.0)
                 _vs_buy_pct = _vs.get("buy_pct", 0.5)
                 _vs_guard_thresh = 15.0
                 _is_against = (
                     (result["action"] == "open_long" and "卖方主导" in _vs_dir and _vs_buy_pct < 0.25) or
                     (result["action"] == "open_short" and "买方主导" in _vs_dir and _vs_buy_pct > 0.75)
                 )
-                if _vs_mult_g >= _vs_guard_thresh and _is_against:
-                    _orig_action = result.get("action", "")
+                if _vs_mult >= _vs_guard_thresh and _is_against:
+                    _orig = result.get("action", "")
                     result["action"] = "hold"
                     result["confidence"] = 0.0
                     result["reason"] = (result.get("reason", "") +
-                        f" | ⚠️ VSpike方向守卫：{_vs_mult_g:.1f}x {_vs_dir}(buy_pct={_vs_buy_pct:.2f})，否决{_orig_action}")
+                        f" | ⚠️ VSpike方向守卫：{_vs_mult:.1f}x {_vs_dir}(buy_pct={_vs_buy_pct:.2f})，否决{_orig}")
                     log.warning(
-                        f"🛡️ VSpike方向守卫拦截：{_vs_mult_g:.1f}x {_vs_dir} "
-                        f"buy_pct={_vs_buy_pct:.2f}，否决{_orig_action}"
+                        f"🛡️ VSpike方向守卫拦截：{_vs_mult:.1f}x {_vs_dir} "
+                        f"buy_pct={_vs_buy_pct:.2f}，否决{_orig}"
                     )
-                    # 记录冲突冷却快照
-                    gs_set("last_aggressive_conflict_ts", time.monotonic())
-                    gs_set("last_aggressive_conflict_dir", _vs_dir)
 
                 return result
 
@@ -1720,11 +1846,31 @@ class SmartAIConsultant:
                 is_timeout = any(kw in err_str.lower()
                                  for kw in ("timeout", "timed out", "read timeout"))
 
-                # 任何模型超时 → fallback 到 r1
+                # 任何模型超时 → 智能 fallback（按 L1 意图分类处理）
                 if 'r1' in locals() and r1:
-                    log.warning(f"⏱️ 模型调用超时/异常，采纳 r1={r1.get('action')} conf={r1.get('confidence', 0):.2f}")
-                    gs_set("ai_consecutive_timeout", 0)
-                    return r1
+                    _l1_a = r1.get("action", "hold")
+                    _l1_c = r1.get("confidence", 0.0)
+                    if _l1_a in ("close_short", "close_long", "close"):
+                        log.warning(
+                            f"⏱️ L2超时，但 L1 原本想 close ({_l1_a} conf={_l1_c:.2f})，"
+                            f"降级执行 close（conf={max(0.55, _l1_c*0.85):.2f}）"
+                        )
+                        r1["confidence"] = max(0.55, _l1_c * 0.85)
+                        gs_set("ai_consecutive_timeout", 0)
+                        return r1
+                    elif _l1_a in ("open_long", "open_short"):
+                        log.warning(f"⏱️ L2超时，L1 想开仓 → 安全 fallback hold")
+                        r1["action"] = "hold"
+                        r1["confidence"] = 0.0
+                        r1["reason"] = f"[L2超时安全降级] {r1.get('reason','')}"
+                        gs_set("ai_consecutive_timeout", 0)
+                        return r1
+                    else:
+                        log.warning(f"⏱️ 模型调用超时/异常，采纳 r1 hold")
+                        r1["action"] = "hold"
+                        r1["confidence"] = 0.0
+                        gs_set("ai_consecutive_timeout", 0)
+                        return r1
 
                 if is_timeout:
                     n = gs_increment("ai_consecutive_timeout")
@@ -1796,11 +1942,11 @@ class FastLaneModule:
         """触发异步AI决策"""
         return self.trader._trigger_ai_async_sym(symbol, *args, **kwargs)
 
-    def _get_ai_decision(self, symbol: str = None) -> Optional[Dict]:
-        return self.trader._get_ai_decision(symbol)
+    def _get_ai_decision(self, symbol: str = None, atr_ratio: float = None) -> Optional[Dict]:
+        return self.trader._get_ai_decision(symbol, atr_ratio=atr_ratio)
 
-    def _clear_ai_cache(self, symbol: str = None):
-        self.trader._clear_ai_cache(symbol)
+    def _clear_ai_cache(self, symbol: str = None, clear_last: bool = False):
+        self.trader._clear_ai_cache(symbol, clear_last=clear_last)
 
     def _get_cache_ttl(self, market_mode: str = None) -> int:
         """缓存 TTL 动态化"""
