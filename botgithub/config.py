@@ -63,6 +63,23 @@ _CFG_FIELD_MAP: Dict[str, tuple] = {
     "OSC_AGGRESSIVE_ADX_THRESH": ("osc_aggressive_adx_thresh", float),
     "SL_MIN_ATR_MULT":           ("sl_min_atr_mult",           float),
     "OSC_LEVEL_PROXIMITY":       ("osc_level_proximity",       float),
+    "RSI_SILENCE_LOW":          ("rsi_silence_low",          float),
+    "RSI_SILENCE_HIGH":         ("rsi_silence_high",         float),
+    "ATR_TRUNC_MULT_HIGH":      ("atr_trunc_mult_high",      float),
+    "ATR_TRUNC_MULT_NORMAL":     ("atr_trunc_mult_normal",    float),
+    "ATR_TRUNC_MULT_LOW":       ("atr_trunc_mult_low",       float),
+    "BB_WIDTH_PHYSICAL_FLOOR":  ("bb_width_physical_floor", float),
+    "TREND_TP_TIGHTEN_R":       ("trend_tp_tighten_r",       float),
+    "OSC_TP_RR_RATIO":          ("osc_tp_rr_ratio",         float),
+    "OSC_AGGR_TP_RR_RATIO":     ("osc_aggr_tp_rr_ratio",    float),
+    "TP_2_5R_CLOSE_PCT":         ("tp_2_5R_close_pct",        float),
+    # ── Regime 复合化阈值（方向1）───────────────────────────────────────
+    "REGIME_THRESH_TREND_TO_OSC":  ("regime_thresh_trend_to_osc",  float),
+    "REGIME_THRESH_TREND_TO_AGGR": ("regime_thresh_trend_to_aggr", float),
+    "REGIME_THRESH_OSC_TO_TREND":  ("regime_thresh_osc_to_trend",  float),
+    "REGIME_THRESH_OSC_TO_AGGR":  ("regime_thresh_osc_to_aggr",  float),
+    "REGIME_THRESH_AGGR_TO_OSC":  ("regime_thresh_aggr_to_osc",  float),
+    "REGIME_THRESH_AGGR_TO_TREND":("regime_thresh_aggr_to_trend", float),
 }
 
 # ── Level 0：永久锁定值 ─────────────────────────────────────────────────
@@ -118,6 +135,25 @@ _LEVEL2_BOUNDS: Dict[str, tuple] = {
     "OSC_AGGRESSIVE_ADX_THRESH":  ("osc_aggressive_adx_thresh",  float, 16.0,  26.0),
     "SL_MIN_ATR_MULT":             ("sl_min_atr_mult",            float, 0.30,  1.00),
     "OSC_LEVEL_PROXIMITY":        ("osc_level_proximity",        float, 0.001, 0.005),
+    "OSC_CONVICTION_OPEN_MIN":    ("osc_conviction_open_min",    float, 50.0,  65.0),
+    "CONVICTION_OPEN_MIN":        ("conviction_open_min",        float, 50.0,  65.0),
+    "ATR_TRUNC_MULT_HIGH":         ("atr_trunc_mult_high",      float, 2.0,   4.0),
+    "ATR_TRUNC_MULT_NORMAL":       ("atr_trunc_mult_normal",    float, 1.5,   3.0),
+    "ATR_TRUNC_MULT_LOW":          ("atr_trunc_mult_low",       float, 1.0,   2.5),
+    "BB_WIDTH_PHYSICAL_FLOOR":     ("bb_width_physical_floor", float, 0.010, 0.025),
+    "RSI_SILENCE_LOW":             ("rsi_silence_low",          float, 30.0,  50.0),
+    "RSI_SILENCE_HIGH":            ("rsi_silence_high",         float, 50.0,  70.0),
+    "TREND_TP_TIGHTEN_R":         ("trend_tp_tighten_r",      float, 1.5,   3.0),
+    "OSC_TP_RR_RATIO":            ("osc_tp_rr_ratio",         float, 1.2,   2.5),
+    "OSC_AGGR_TP_RR_RATIO":       ("osc_aggr_tp_rr_ratio",    float, 1.0,   2.0),
+    "TP_2_5R_CLOSE_PCT":          ("tp_2_5R_close_pct",       float, 0.15,  0.40),
+    # ── Regime 复合化阈值（方向1）───────────────────────────────────────
+    "REGIME_THRESH_TREND_TO_OSC":  ("regime_thresh_trend_to_osc",  float, 0.35,  0.55),
+    "REGIME_THRESH_TREND_TO_AGGR": ("regime_thresh_trend_to_aggr", float, 0.65,  0.85),
+    "REGIME_THRESH_OSC_TO_TREND":  ("regime_thresh_osc_to_trend",  float, 0.30,  0.50),
+    "REGIME_THRESH_OSC_TO_AGGR":  ("regime_thresh_osc_to_aggr",  float, 0.60,  0.80),
+    "REGIME_THRESH_AGGR_TO_OSC":  ("regime_thresh_aggr_to_osc",  float, 0.32,  0.52),
+    "REGIME_THRESH_AGGR_TO_TREND":("regime_thresh_aggr_to_trend", float, 0.30,  0.50),
 }
 
 _dyn_cfg: Dict[str, Any] = {}
@@ -144,7 +180,6 @@ def _safe_cast(value: str, target_type: type):
 # ══════════════════════════════════════════════════════════════════════════════
 class BotConfig:
     symbol:                str   = os.getenv("TRADING_SYMBOL", "ETH-USDT-SWAP").strip()
-    check_interval:        int   = int(os.getenv("OKX_CHECK_INTERVAL", "300"))
     risk_check_interval:   int   = int(os.getenv("RISK_CHECK_INTERVAL", "2"))
     check_interval_hold:   int   = int(os.getenv("CHECK_INTERVAL_HOLD",   "90"))
     check_interval_level:  int   = int(os.getenv("CHECK_INTERVAL_LEVEL",  "60"))
@@ -173,13 +208,13 @@ class BotConfig:
     fg_refresh_minutes_osc: int  = int(os.getenv("FG_REFRESH_MINUTES_OSC", "120"))
     slippage_pct:          float = float(os.getenv("SLIPPAGE_PCT", "0.0005"))
     max_slippage_thresh:   float = float(os.getenv("MAX_SLIPPAGE_THRESH", "0.002"))
-    trailing_act_pct:      float = float(os.getenv("TRAILING_ACT_PCT", "0.005"))
-    trailing_dist_pct:     float = float(os.getenv("TRAILING_DIST_PCT", "0.015"))
+    trailing_act_pct:      float = float(os.getenv("TRAILING_ACT_PCT", "0.003"))
+    trailing_dist_pct:     float = float(os.getenv("TRAILING_DIST_PCT", "0.010"))
     order_wait_seconds:    int   = int(os.getenv("ORDER_WAIT_SECONDS", "30"))
     price_decimals:        int   = int(os.getenv("PRICE_DECIMALS", "2"))
     funding_rate_thresh:   float = float(os.getenv("FUNDING_RATE_THRESH", "0.003"))
     liq_warn_pct:          float = float(os.getenv("LIQ_WARN_PCT", "0.05"))
-    max_consecutive_loss:  int   = int(os.getenv("MAX_CONSECUTIVE_LOSS", "3"))
+    max_consecutive_loss:  int   = int(os.getenv("MAX_CONSECUTIVE_LOSS", "4"))
     min_cooldown_after_loss: int = int(os.getenv("MIN_COOLDOWN_AFTER_LOSS", "20"))
     consecutive_loss_reduce_factor: float = float(os.getenv("CONSECUTIVE_LOSS_REDUCE_FACTOR", "0.7"))
     reasoner_min_pnl_pct:     float = float(os.getenv("REASONER_MIN_PNL_PCT", "-2.0"))
@@ -221,8 +256,6 @@ class BotConfig:
     ai_retry_delay:         float = float(os.getenv("AI_RETRY_DELAY", "5"))
     ai_timeout_alert_count: int   = int(os.getenv("AI_TIMEOUT_ALERT_COUNT", "3"))
     ai_min_request_interval: int = int(os.getenv("AI_MIN_REQUEST_INTERVAL", "10"))
-    # 策略委员会（已废弃，保留 committee_enabled 向下兼容）
-    committee_enabled:        bool  = os.getenv("COMMITTEE_ENABLED", "true").lower() == "true"
     max_hold_silence_minutes: int   = int(os.getenv("MAX_HOLD_SILENCE_MINUTES", "15"))
     silence_force_wakeup_loss_pct:  float = float(os.getenv("SILENCE_FORCE_WAKEUP_LOSS_PCT", "-3.0"))
     silence_force_wakeup_atr_mult: float = float(os.getenv("SILENCE_FORCE_WAKEUP_ATR_MULT", "3.5"))
@@ -240,7 +273,7 @@ class BotConfig:
     # ── SL ATR 自适应参数（各市场模式 floor/cap）─────────────────────────────
     sl_atr_floor_osc_aggr: float = float(os.getenv("SL_ATR_FLOOR_OSC_AGGR", "0.8"))
     sl_atr_cap_osc_aggr:    float = float(os.getenv("SL_ATR_CAP_OSC_AGGR",    "2.2"))
-    sl_atr_floor_osc:       float = float(os.getenv("SL_ATR_FLOOR_OSC",       "1.0"))
+    sl_atr_floor_osc:       float = float(os.getenv("SL_ATR_FLOOR_OSC",       "1.3"))
     sl_atr_cap_osc:         float = float(os.getenv("SL_ATR_CAP_OSC",         "2.5"))
     sl_atr_floor_trend:     float = float(os.getenv("SL_ATR_FLOOR_TREND",     "1.8"))
     sl_atr_cap_trend:       float = float(os.getenv("SL_ATR_CAP_TREND",       "3.0"))
@@ -290,9 +323,10 @@ class BotConfig:
     vspike_escape_baseline: float = float(os.getenv("VSPIKE_ESCAPE_BASELINE", "20.0"))
     escape_loss_min:       float = float(os.getenv("ESCAPE_LOSS_MIN",       "0.005"))
     profit_protect_thresh: float = float(os.getenv("PROFIT_PROTECT_THRESH", "0.01"))
-    blocked_close_cooldown: int  = int(os.getenv("BLOCKED_CLOSE_COOLDOWN",  "120"))
+    startup_cooldown_seconds: int = int(os.getenv("STARTUP_COOLDOWN_SECONDS", "180"))
     drawdown_kelly_decay_start: float = float(os.getenv("DRAWDOWN_KELLY_DECAY_START", "0.04"))
     drawdown_kelly_floor:       float = float(os.getenv("DRAWDOWN_KELLY_FLOOR",       "0.25"))
+    osc_conviction_open_min:    float = float(os.getenv("OSC_CONVICTION_OPEN_MIN",   "57.0"))
     conviction_open_min:        float = float(os.getenv("CONVICTION_OPEN_MIN",        "55.0"))
     osc_conviction_min:         float = float(os.getenv("OSC_CONVICTION_MIN",         "40.0"))
     conviction_vspike_tau:      float = float(os.getenv("CONVICTION_VSPIKE_TAU",      "8.0"))
@@ -302,16 +336,15 @@ class BotConfig:
     stale_lev_reduction:        float = float(os.getenv("STALE_DATA_LEV_REDUCTION",   "0.8"))
     ai_failure_exp_backoff:     float = float(os.getenv("AI_FAILURE_EXP_BACKOFF",     "1.5"))
     vspike_priority_threshold:  float = float(os.getenv("VSPIKE_PRIORITY_THRESHOLD",  "15.0"))
-    aggressive_conflict_cooldown: float = float(os.getenv("AGGRESSIVE_CONFLICT_COOLDOWN", "180.0"))
+    aggressive_conflict_cooldown: float = float(os.getenv("AGGRESSIVE_CONFLICT_COOLDOWN", "120.0"))
     ai_fastlane_min_interval:   int   = int(os.getenv("AI_FASTLANE_MIN_INTERVAL",     "5"))
     ob_fastlane_imbalance:      float = float(os.getenv("OB_FASTLANE_IMBALANCE",      "0.35"))
     qwen_api_key:             str   = os.getenv("QWEN_API_KEY",              "").strip()
     qwen_base_url:            str   = os.getenv("QWEN_BASE_URL",   "https://dashscope.aliyuncs.com/compatible-mode/v1").strip()
     qwen_model:               str   = os.getenv("QWEN_MODEL",     "qwen-plus").strip()
-    qwen_timeout:             int   = int(os.getenv("QWEN_TIMEOUT",             "6"))
+    qwen_timeout:             int   = int(os.getenv("QWEN_TIMEOUT",             "20"))
     arbitration_min_score:    float = float(os.getenv("ARBITRATION_MIN_SCORE", "70.0"))
     arbitration_max_score:   float = float(os.getenv("ARBITRATION_MAX_SCORE", "82.0"))
-    # risk_per_trade / risk_multiplier_max 已在第159-160行定义，此处删除重复
     max_margin_pct:         float = float(os.getenv("MAX_MARGIN_PCT", "0.25"))
     max_position_pct:       float = float(os.getenv("MAX_POSITION_PCT", "0.40"))
     slippage_adapt_enable:  bool  = os.getenv("SLIPPAGE_ADAPT_ENABLE", "true").lower() == "true"
@@ -334,6 +367,32 @@ class BotConfig:
     max_historical_cases: int = int(os.getenv("MAX_HISTORICAL_CASES", "15"))
     case_max_age_days: int = int(os.getenv("CASE_MAX_AGE_DAYS", "90"))
     enable_auto_case_pool: bool = os.getenv("ENABLE_AUTO_CASE_POOL", "true").lower() == "true"
+    # ── Magic Numbers 抽取（方向3）─────────────────────────────────────────────
+    rsi_silence_low:        float = float(os.getenv("RSI_SILENCE_LOW",        "40.0"))
+    rsi_silence_high:        float = float(os.getenv("RSI_SILENCE_HIGH",        "60.0"))
+    atr_trunc_mult_high:    float = float(os.getenv("ATR_TRUNC_MULT_HIGH",    "3.0"))
+    atr_trunc_mult_normal:  float = float(os.getenv("ATR_TRUNC_MULT_NORMAL",  "2.0"))
+    atr_trunc_mult_low:     float = float(os.getenv("ATR_TRUNC_MULT_LOW",     "1.5"))
+    bb_width_physical_floor:float = float(os.getenv("BB_WIDTH_PHYSICAL_FLOOR","0.015"))
+    trend_tp_tighten_r:     float = float(os.getenv("TREND_TP_TIGHTEN_R",    "2.0"))
+    osc_tp_rr_ratio:       float = float(os.getenv("OSC_TP_RR_RATIO",       "1.5"))
+    osc_aggr_tp_rr_ratio:  float = float(os.getenv("OSC_AGGR_TP_RR_RATIO",  "1.2"))
+    tp_2_5R_close_pct:      float = float(os.getenv("TP_2_5R_CLOSE_PCT",    "0.25"))
+    # ── Regime 复合化阈值（方向1）─────────────────────────────────────────────
+    regime_thresh_trend_to_osc:  float = float(os.getenv("REGIME_THRESH_TREND_TO_OSC",  "0.45"))
+    regime_thresh_trend_to_aggr: float = float(os.getenv("REGIME_THRESH_TREND_TO_AGGR", "0.78"))
+    regime_thresh_osc_to_trend:  float = float(os.getenv("REGIME_THRESH_OSC_TO_TREND",  "0.40"))
+    regime_thresh_osc_to_aggr:  float = float(os.getenv("REGIME_THRESH_OSC_TO_AGGR",  "0.72"))
+    regime_thresh_aggr_to_osc:  float = float(os.getenv("REGIME_THRESH_AGGR_TO_OSC",  "0.42"))
+    regime_thresh_aggr_to_trend: float = float(os.getenv("REGIME_THRESH_AGGR_TO_TREND", "0.38"))
+    # 规则引擎直出门槛（0.72 配合 Fast AI 双保险，允许布林带等常规信号 0.72+ 通过）
+    rule_engine_bypass_conf:  float = float(os.getenv("RULE_ENGINE_BYPASS_CONF",  "0.72"))
+    # ── 打板突破阈值 ──────────────────────────────────────────────────────
+    breakout_vol_min_trend:   float = float(os.getenv("BREAKOUT_VOL_MIN_TREND",   "1.4"))
+    breakout_vol_min_osc:     float = float(os.getenv("BREAKOUT_VOL_MIN_OSC",     "1.2"))
+    breakout_ob_min_trend:    float = float(os.getenv("BREAKOUT_OB_MIN_TREND",    "0.25"))
+    breakout_ob_min_osc:      float = float(os.getenv("BREAKOUT_OB_MIN_OSC",      "0.20"))
+    breakout_conf_min:        float = float(os.getenv("BREAKOUT_CONF_MIN",        "0.60"))
 
     def __init__(self):
         if self.okx_kline_urls is None:
